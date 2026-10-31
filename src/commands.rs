@@ -1,6 +1,7 @@
 use crate::{
     cli::{Command, InitArgs, Network, WalletCommand},
-    config::ConfigStore,
+    config::{AppConfig, ConfigStore},
+    deployment::DeploymentManifest,
     mining,
     rpc::{NetworkClient, NodeView},
     wallet,
@@ -52,10 +53,16 @@ pub async fn dispatch(command: Command) -> Result<()> {
             }
             Ok(())
         }
+        Command::GetRpc { network } => run_get_rpc(network),
+        Command::SetRpc { network, endpoint } => run_set_rpc(network, endpoint).await,
         Command::Nodes => {
             let store = ConfigStore::system_default()?;
             let config = store.load()?;
-            let client = NetworkClient::connect(config.network).await?;
+            let client = NetworkClient::connect_with_rpc(
+                config.network,
+                config.rpc_override(config.network),
+            )
+            .await?;
             if !client.has_mining_deployment() {
                 println!(
                     "{} has no verified Astatine mining deployment.",
@@ -79,15 +86,16 @@ pub async fn dispatch(command: Command) -> Result<()> {
 async fn run_init(args: InitArgs) -> Result<()> {
     let store = ConfigStore::system_default()?;
     let mut config = store.load()?;
-    println!("Astatine setup.");
+    println!("ASTATINE · INITIAL SETUP");
     println!(
-        "Automatic permissionless finalization can spend gas on empty windows or windows won by another miner. That maximum exposure counts toward the session cap; the default cap of zero authorizes no transaction spending."
+        "Every signed transaction permanently consumes its maximum possible INJ authorization for this session; RPC receipts do not refund it. Finalization can spend gas on empty windows or windows won by another miner. The default cap of zero authorizes no transaction spending."
     );
 
     config.network = match args.network {
         Some(network) => network,
         None => prompt_network(config.network)?,
     };
+    configure_init_rpc(&mut config, args.rpc.as_deref()).await?;
     config.cpu_threads = match args.threads {
         Some(threads) => threads.get(),
         None => prompt_threads(config.cpu_threads)?,
@@ -99,7 +107,7 @@ async fn run_init(args: InitArgs) -> Result<()> {
     config.per_session_spending_limit_inj = match args.spending_limit_inj {
         Some(amount) => amount,
         None => prompt_value(
-            "Per-session maximum INJ transaction exposure",
+            "Per-session maximum INJ transaction authorization",
             &config.per_session_spending_limit_inj,
         )?,
     };
@@ -166,7 +174,7 @@ async fn run_init(args: InitArgs) -> Result<()> {
     config.validate()?;
     store.save(&config)?;
     println!(
-        "Configured {} | {} CPU worker(s) | reserve {} INJ | per-session maximum exposure {} INJ | confirmations {} block(s)",
+        "Configured {} | {} CPU worker(s) | reserve {} INJ | per-session authorization cap {} INJ | confirmations {} block(s)",
         network_label(config.network),
         config.cpu_threads,
         config.minimum_reserve_inj,
@@ -190,7 +198,9 @@ async fn run_status() -> Result<()> {
         .map(Address::from_str)
         .transpose()
         .context("configured wallet address is invalid")?;
-    let client = NetworkClient::connect(config.network).await?;
+    let client =
+        NetworkClient::connect_with_rpc(config.network, config.rpc_override(config.network))
+            .await?;
     let snapshot = client.snapshot(wallet_address).await?;
     let eligible = snapshot
         .nodes
@@ -235,10 +245,12 @@ async fn run_rewards() -> Result<()> {
     let store = ConfigStore::system_default()?;
     let config = store.load()?;
     let address = wallet::selected_address(&config)?;
-    let client = NetworkClient::connect(config.network).await?;
+    let client =
+        NetworkClient::connect_with_rpc(config.network, config.rpc_override(config.network))
+            .await?;
     let snapshot = client.snapshot(Some(address)).await?;
     if !client.verification.token_verified {
-        bail!("AST token runtime is not verified; refusing to report a token balance as verified");
+        bail!("AST token runtime pin is not verified; refusing to read its token balance");
     }
     let balance = snapshot
         .ast_balance
@@ -250,10 +262,182 @@ async fn run_rewards() -> Result<()> {
         .map(|token| token.decimals)
         .context("AST token is not configured")?;
     println!(
-        "AST wallet balance: {} (token balance; this is not per-window reward attribution)",
+        "AST wallet balance reported by the selected RPC: {} (token balance; this is not per-window reward attribution)",
         format_token_units(balance, decimals)
     );
     Ok(())
+}
+
+fn run_get_rpc(requested_network: Option<Network>) -> Result<()> {
+    let store = ConfigStore::system_default()?;
+    let config = store.load()?;
+    let network = requested_network.unwrap_or(config.network);
+    let manifest = DeploymentManifest::load(network)?;
+    let custom_rpc = config.rpc_override(network);
+    let active_rpc = custom_rpc.unwrap_or(&manifest.primary_rpc);
+    println!("Network: {}", network_label(network));
+    println!("Chain ID: {}", manifest.chain_id);
+    println!("Active RPC: {}", redact_rpc_url(active_rpc));
+    println!(
+        "Source: {}",
+        if custom_rpc.is_some() {
+            "user override"
+        } else {
+            "bundled network default"
+        }
+    );
+    if let Some(archival_rpc) = &manifest.archival_rpc {
+        println!(
+            "Bundled archival RPC: {} ({})",
+            redact_rpc_url(archival_rpc),
+            if custom_rpc.is_some() {
+                "not used as an automatic fallback for a custom primary"
+            } else {
+                "historical-read fallback only"
+            }
+        );
+    }
+    Ok(())
+}
+
+async fn run_set_rpc(
+    requested_network: Option<Network>,
+    requested_endpoint: Option<String>,
+) -> Result<()> {
+    let store = ConfigStore::system_default()?;
+    let mut config = store.load()?;
+    let network = requested_network.unwrap_or(config.network);
+    let manifest = DeploymentManifest::load(network)?;
+    let current_rpc = config
+        .rpc_override(network)
+        .unwrap_or(&manifest.primary_rpc);
+    println!(
+        "Network: {} · chain ID {}",
+        network_label(network),
+        manifest.chain_id
+    );
+    println!("Current RPC: {}", redact_rpc_url(current_rpc));
+
+    let endpoint = match requested_endpoint {
+        Some(endpoint) => endpoint,
+        None => prompt_value(
+            "New RPC URL (`default` restores bundled RPC; Enter keeps current)",
+            "",
+        )?,
+    };
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        println!("Kept the current RPC configuration.");
+        return Ok(());
+    }
+    persist_rpc_override(&store, &mut config, network, endpoint).await?;
+    if endpoint.eq_ignore_ascii_case("default") {
+        println!("Restored the bundled {} RPC.", network_label(network));
+    } else {
+        println!("Saved custom RPC: {}", redact_rpc_url(endpoint));
+    }
+    Ok(())
+}
+
+async fn configure_init_rpc(
+    config: &mut AppConfig,
+    requested_endpoint: Option<&str>,
+) -> Result<()> {
+    let network = config.network;
+    let manifest = DeploymentManifest::load(network)?;
+    println!("\nNetwork: {}", network_label(network));
+    println!("Chain ID: {}", manifest.chain_id);
+    println!("Default RPC:\n{}", redact_rpc_url(&manifest.primary_rpc));
+
+    if let Some(endpoint) = requested_endpoint {
+        apply_init_rpc(config, network, endpoint).await?;
+        return Ok(());
+    }
+
+    if let Some(current) = config.rpc_override(network) {
+        println!("Saved custom RPC: {}", redact_rpc_url(current));
+        if prompt_yes_no("Keep the saved custom RPC?", true)? {
+            return Ok(());
+        }
+        let endpoint = prompt_value(
+            "New trusted RPC URL (`default` restores bundled RPC; Enter keeps current)",
+            "",
+        )?;
+        if !endpoint.trim().is_empty() {
+            apply_init_rpc(config, network, &endpoint).await?;
+        }
+        return Ok(());
+    }
+
+    if prompt_yes_no("Would you like to use a custom RPC?", false)? {
+        let endpoint = prompt_value("Custom trusted RPC URL", "")?;
+        if endpoint.trim().is_empty() {
+            bail!("a custom RPC URL is required after selecting custom RPC setup");
+        }
+        apply_init_rpc(config, network, &endpoint).await?;
+    }
+    Ok(())
+}
+
+async fn apply_init_rpc(config: &mut AppConfig, network: Network, endpoint: &str) -> Result<()> {
+    select_rpc_override(config, network, endpoint).await
+}
+
+async fn select_rpc_override(
+    config: &mut AppConfig,
+    network: Network,
+    endpoint: &str,
+) -> Result<()> {
+    let endpoint = endpoint.trim();
+    if endpoint.eq_ignore_ascii_case("default") {
+        config.set_rpc_override(network, None);
+        return Ok(());
+    }
+    NetworkClient::validate_rpc_endpoint(network, endpoint).await?;
+    config.set_rpc_override(network, Some(endpoint.to_owned()));
+    Ok(())
+}
+
+async fn persist_rpc_override(
+    store: &ConfigStore,
+    config: &mut AppConfig,
+    network: Network,
+    endpoint: &str,
+) -> Result<()> {
+    let mut updated = config.clone();
+    select_rpc_override(&mut updated, network, endpoint).await?;
+    store.save(&updated)?;
+    *config = updated;
+    Ok(())
+}
+
+fn redact_rpc_url(endpoint: &str) -> String {
+    let Ok(mut url) = reqwest::Url::parse(endpoint) else {
+        return "<invalid saved RPC URL>".to_owned();
+    };
+    let mut redacted = false;
+    if !url.username().is_empty() || url.password().is_some() {
+        let _ = url.set_username("");
+        let _ = url.set_password(None);
+        redacted = true;
+    }
+    if url.query().is_some() {
+        url.set_query(None);
+        redacted = true;
+    }
+    if url.fragment().is_some() {
+        url.set_fragment(None);
+        redacted = true;
+    }
+    if url.path() != "/" {
+        url.set_path("/<redacted>");
+        redacted = true;
+    }
+    if redacted {
+        format!("{url} (path/query/credentials redacted)")
+    } else {
+        url.to_string()
+    }
 }
 
 fn print_nodes(nodes: &[NodeView]) {
@@ -397,5 +581,209 @@ fn chain_id(network: Network) -> u64 {
     match network {
         Network::Testnet => 1439,
         Network::Mainnet => 1776,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{configure_init_rpc, persist_rpc_override, redact_rpc_url, select_rpc_override};
+    use crate::{
+        cli::Network,
+        config::{AppConfig, ConfigStore},
+        transaction::TransactionJournal,
+    };
+    use alloy_primitives::Address;
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        thread::{self, JoinHandle},
+    };
+
+    fn mock_chain_id_rpc(chain_id: &'static str) -> (String, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut chunk = [0_u8; 1024];
+                let count = stream.read(&mut chunk).unwrap();
+                assert_ne!(count, 0, "RPC client closed before sending its request");
+                request.extend_from_slice(&chunk[..count]);
+                let Some(header_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .filter_map(|line| line.split_once(':'))
+                    .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                    .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if request.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+            let body = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": chain_id,
+            })
+            .to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        (format!("http://{address}"), server)
+    }
+
+    #[tokio::test]
+    async fn invalid_rpc_selection_preserves_saved_config_and_other_network_override() {
+        let root = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at_root(root.path().to_path_buf());
+        let mut config = AppConfig {
+            testnet_rpc: Some("https://testnet.example.org/path-secret?token=secret".to_owned()),
+            ..AppConfig::default()
+        };
+        store.save(&config).unwrap();
+        let before = store.load().unwrap();
+
+        assert!(
+            persist_rpc_override(
+                &store,
+                &mut config,
+                Network::Testnet,
+                "http://remote.example.org",
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(config, before);
+        assert_eq!(store.load().unwrap(), before);
+
+        select_rpc_override(&mut config, Network::Mainnet, "default")
+            .await
+            .unwrap();
+        assert_eq!(
+            config.rpc_override(Network::Testnet),
+            before.rpc_override(Network::Testnet)
+        );
+        assert_eq!(config.rpc_override(Network::Mainnet), None);
+    }
+
+    #[tokio::test]
+    async fn init_and_rpc_changes_preserve_wallet_and_transaction_journal() {
+        let root = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at_root(root.path().to_path_buf());
+        let wallet_address = Address::with_last_byte(0xa1);
+        let wallet = format!("{wallet_address:#x}");
+        let mut config = AppConfig {
+            wallet_address: Some(wallet.clone()),
+            per_session_spending_limit_inj: "1".to_owned(),
+            testnet_rpc: Some("https://old-testnet.example/rpc".to_owned()),
+            mainnet_rpc: Some("https://mainnet.example/rpc".to_owned()),
+            ..AppConfig::default()
+        };
+        store.save(&config).unwrap();
+        drop(TransactionJournal::open(&store, &config, wallet_address).unwrap());
+        let mut journal_state: serde_json::Value =
+            serde_json::from_slice(&store.read_transaction_journal().unwrap().unwrap()).unwrap();
+        let session_id = journal_state["active_session"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        journal_state["active_session"]["authorized_exposure_wei"] =
+            serde_json::Value::String("123".to_owned());
+        journal_state["active_session"]["reported_actual_wei"] =
+            serde_json::Value::String("7".to_owned());
+        let journal = serde_json::to_vec(&journal_state).unwrap();
+        store.write_transaction_journal(&journal).unwrap();
+
+        let (endpoint, server) = mock_chain_id_rpc("0x59f");
+        configure_init_rpc(&mut config, Some(&endpoint))
+            .await
+            .unwrap();
+        server.join().unwrap();
+        store.save(&config).unwrap();
+        assert_eq!(
+            store.load().unwrap().wallet_address.as_deref(),
+            Some(wallet.as_str())
+        );
+        assert_eq!(
+            config.rpc_override(Network::Testnet),
+            Some(endpoint.as_str())
+        );
+        assert_eq!(
+            config.rpc_override(Network::Mainnet),
+            Some("https://mainnet.example/rpc")
+        );
+        assert_eq!(store.read_transaction_journal().unwrap().unwrap(), journal);
+        let reopened = TransactionJournal::open(&store, &config, wallet_address).unwrap();
+        drop(reopened);
+
+        let (set_endpoint, set_server) = mock_chain_id_rpc("0x59f");
+        persist_rpc_override(&store, &mut config, Network::Testnet, &set_endpoint)
+            .await
+            .unwrap();
+        set_server.join().unwrap();
+        assert_eq!(
+            config.rpc_override(Network::Testnet),
+            Some(set_endpoint.as_str())
+        );
+        assert_eq!(config.wallet_address.as_deref(), Some(wallet.as_str()));
+        assert_eq!(store.read_transaction_journal().unwrap().unwrap(), journal);
+        let reopened = TransactionJournal::open(&store, &config, wallet_address).unwrap();
+        drop(reopened);
+
+        persist_rpc_override(&store, &mut config, Network::Testnet, "default")
+            .await
+            .unwrap();
+        assert_eq!(config.rpc_override(Network::Testnet), None);
+        assert_eq!(
+            config.rpc_override(Network::Mainnet),
+            Some("https://mainnet.example/rpc")
+        );
+        assert_eq!(config.wallet_address.as_deref(), Some(wallet.as_str()));
+        assert_eq!(
+            store.load().unwrap().wallet_address.as_deref(),
+            Some(wallet.as_str())
+        );
+        assert_eq!(store.read_transaction_journal().unwrap().unwrap(), journal);
+        let reopened = TransactionJournal::open(&store, &config, wallet_address).unwrap();
+        drop(reopened);
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&store.read_transaction_journal().unwrap().unwrap()).unwrap();
+        assert_eq!(persisted["active_session"]["id"], session_id);
+        assert_eq!(
+            persisted["active_session"]["authorized_exposure_wei"],
+            "123"
+        );
+        assert_eq!(persisted["active_session"]["reported_actual_wei"], "7");
+    }
+
+    #[test]
+    fn rpc_display_redacts_credentials_path_query_and_fragment() {
+        for url in [
+            "https://rpc.example.org/path-secret?token=query-secret#private-fragment",
+            "https://user:password@rpc.example.org/",
+        ] {
+            let display = redact_rpc_url(url);
+            for secret in [
+                "path-secret",
+                "query-secret",
+                "private-fragment",
+                "password",
+            ] {
+                assert!(!display.contains(secret));
+            }
+        }
+        assert_eq!(
+            redact_rpc_url("https://rpc.example.org/"),
+            "https://rpc.example.org/"
+        );
     }
 }

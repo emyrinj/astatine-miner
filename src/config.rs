@@ -1,6 +1,7 @@
 use crate::cli::Network;
 use alloy_primitives::{Address, U256};
 use anyhow::{Context, Result, bail};
+use reqwest::Url;
 use serde::{Deserialize, Serialize};
 #[cfg(any(unix, windows))]
 use std::fs::File;
@@ -8,6 +9,7 @@ use std::{
     env, fs,
     fs::OpenOptions,
     io::{Read, Write},
+    net::IpAddr,
     path::{Path, PathBuf},
     str::FromStr,
 };
@@ -31,6 +33,10 @@ pub struct AppConfig {
     pub cpu_threads: usize,
     pub minimum_reserve_inj: String,
     pub per_session_spending_limit_inj: String,
+    #[serde(default)]
+    pub testnet_rpc: Option<String>,
+    #[serde(default)]
+    pub mainnet_rpc: Option<String>,
     #[serde(default = "default_transaction_confirmations")]
     pub transaction_confirmations: u8,
 }
@@ -44,6 +50,8 @@ impl Default for AppConfig {
             cpu_threads: conservative_thread_budget(),
             minimum_reserve_inj: "0.1".to_owned(),
             per_session_spending_limit_inj: "0".to_owned(),
+            testnet_rpc: None,
+            mainnet_rpc: None,
             transaction_confirmations: DEFAULT_TRANSACTION_CONFIRMATIONS,
         }
     }
@@ -72,8 +80,58 @@ impl AppConfig {
         if let Some(address) = &self.wallet_address {
             Address::from_str(address).context("configured wallet address is invalid")?;
         }
+        if let Some(rpc) = &self.testnet_rpc {
+            validate_rpc_url(rpc).context("Testnet RPC override is invalid")?;
+        }
+        if let Some(rpc) = &self.mainnet_rpc {
+            validate_rpc_url(rpc).context("Mainnet RPC override is invalid")?;
+        }
         Ok(())
     }
+
+    pub fn rpc_override(&self, network: Network) -> Option<&str> {
+        match network {
+            Network::Testnet => self.testnet_rpc.as_deref(),
+            Network::Mainnet => self.mainnet_rpc.as_deref(),
+        }
+    }
+
+    pub fn set_rpc_override(&mut self, network: Network, rpc: Option<String>) {
+        match network {
+            Network::Testnet => self.testnet_rpc = rpc,
+            Network::Mainnet => self.mainnet_rpc = rpc,
+        }
+    }
+}
+
+pub fn validate_rpc_url(endpoint: &str) -> Result<Url> {
+    if endpoint.is_empty() || endpoint.len() > 4096 {
+        bail!("RPC URL is empty or exceeds the supported length");
+    }
+    let url = Url::parse(endpoint).context("parse RPC URL")?;
+    if !url.username().is_empty() || url.password().is_some() {
+        bail!("RPC URL must not embed username or password credentials");
+    }
+    if url.fragment().is_some() {
+        bail!("RPC URL must not contain a fragment");
+    }
+    let host = url.host_str().context("RPC URL must include a host")?;
+    match url.scheme() {
+        "https" => {}
+        "http" if is_loopback_host(host) => {}
+        "http" => bail!("remote RPC endpoints must use HTTPS"),
+        _ => bail!("RPC URL scheme must be HTTP or HTTPS"),
+    }
+    Ok(url)
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if host.eq_ignore_ascii_case("localhost") || host.to_ascii_lowercase().ends_with(".localhost") {
+        return true;
+    }
+    host.parse::<IpAddr>()
+        .is_ok_and(|address| address.is_loopback())
 }
 
 fn default_transaction_confirmations() -> u8 {
@@ -642,7 +700,7 @@ mod tests {
     use super::windows_config_dir;
     #[cfg(unix)]
     use super::xdg_config_dir;
-    use super::{AppConfig, ConfigStore, parse_inj_wei};
+    use super::{AppConfig, ConfigStore, parse_inj_wei, validate_rpc_url};
     use crate::cli::Network;
     use alloy_primitives::U256;
     use std::{ffi::OsStr, path::PathBuf};
@@ -675,6 +733,64 @@ mod tests {
             ..config
         };
         assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn legacy_config_and_network_scoped_rpc_overrides_are_backward_compatible() {
+        let legacy: AppConfig = toml::from_str(
+            r#"
+schema_version = 1
+network = "testnet"
+wallet_address = "0x0000000000000000000000000000000000000001"
+cpu_threads = 2
+minimum_reserve_inj = "0.1"
+per_session_spending_limit_inj = "0"
+transaction_confirmations = 2
+"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.rpc_override(Network::Testnet), None);
+        assert_eq!(legacy.rpc_override(Network::Mainnet), None);
+
+        let temporary = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at_root(temporary.path().join("config"));
+        let mut config = AppConfig::default();
+        config.set_rpc_override(
+            Network::Testnet,
+            Some("https://rpc.test.example/v1/private-token?key=secret".to_owned()),
+        );
+        store.save(&config).unwrap();
+        let loaded = store.load().unwrap();
+        assert_eq!(
+            loaded.rpc_override(Network::Testnet),
+            Some("https://rpc.test.example/v1/private-token?key=secret")
+        );
+        assert_eq!(loaded.rpc_override(Network::Mainnet), None);
+    }
+
+    #[test]
+    fn rpc_url_transport_and_credential_rules_allow_only_local_http() {
+        for url in [
+            "https://rpc.example.org/evm",
+            "http://localhost:8545",
+            "http://127.0.0.1:8545",
+            "http://[::1]:8545",
+        ] {
+            assert!(validate_rpc_url(url).is_ok(), "{url}");
+        }
+        for url in [
+            "http://rpc.example.org/evm",
+            "ftp://rpc.example.org/evm",
+            "https://user:pass@rpc.example.org/evm",
+            "https://rpc.example.org/evm#fragment",
+            "not a URL",
+        ] {
+            let error = validate_rpc_url(url).unwrap_err();
+            assert!(
+                !format!("{error:#}").contains(url),
+                "RPC validation errors must not echo URL tokens"
+            );
+        }
     }
 
     #[cfg(unix)]

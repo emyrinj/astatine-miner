@@ -7,8 +7,9 @@ use crate::{
     proof_telemetry::{ProofAttemptGuard, ProofMetric, ProofPipelineTelemetry},
     protocol::{WorkContext, WorkHasher, beats_incumbent, meets_target},
     rpc::{
-        NetworkClient, ReadSnapshot, RpcLog, TransactionReceipt, is_transient_receipt_error,
-        is_transient_rpc_error, is_window_expired_revert, is_window_not_expired_revert,
+        NetworkClient, ReadSnapshot, RpcLog, TransactionDetails, TransactionReceipt,
+        is_transient_receipt_error, is_transient_rpc_error, is_window_expired_revert,
+        is_window_not_expired_revert,
     },
     wallet::signer_address,
 };
@@ -31,7 +32,7 @@ use tokio::{
     time::{Instant, MissedTickBehavior, interval, sleep},
 };
 
-const JOURNAL_VERSION: u32 = 5;
+const JOURNAL_VERSION: u32 = 7;
 const ARCHIVE_VERSION: u32 = 1;
 const MAX_JOURNAL_ENTRIES: usize = 4_096;
 const ARCHIVE_TRIGGER_ENTRIES: usize = 64;
@@ -47,6 +48,7 @@ const REWARD_SCAN_RETRY_MAX: Duration = Duration::from_secs(30);
 const REWARD_EMPTY_SCAN_RETRY_BASE_SECS: u64 = 60;
 const REWARD_EMPTY_SCAN_RETRY_MAX_SECS: u64 = 3_600;
 const SUBMISSION_FEE_WEI: u128 = 10_000_000_000_000_000;
+pub(crate) const AUTOMATIC_REWARD_FORWARDING_DISABLED: &str = "automatic AST reward forwarding is disabled in Testnet.13 because the selected RPC can fabricate reward evidence; verify rewards independently and transfer manually from your wallet";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Eip1559Request {
@@ -156,6 +158,16 @@ enum TransactionStatus {
     MinedReverted,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ReceiptVerification {
+    Unverified,
+    #[serde(alias = "quorum_corroborated")]
+    TrustedRpcChecked,
+    #[default]
+    LegacyUnverified,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum RewardForwardingStatus {
@@ -187,7 +199,20 @@ struct SpendingSession {
     #[serde(default)]
     wallet: String,
     limit_wei: String,
+    #[serde(default)]
+    authorized_exposure_wei: Option<String>,
+    #[serde(default)]
+    #[serde(alias = "verified_actual_wei")]
+    reported_actual_wei: Option<String>,
     closed: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PendingAuthorization {
+    session_id: String,
+    request_hash: String,
+    maximum_exposure_wei: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -208,6 +233,8 @@ struct TransactionEntry {
     gas_limit: u64,
     maximum_exposure_wei: String,
     status: TransactionStatus,
+    #[serde(default)]
+    receipt_verification: ReceiptVerification,
     actual_cost_wei: Option<String>,
     #[serde(default)]
     last_known_cost_wei: Option<String>,
@@ -318,6 +345,8 @@ struct JournalState {
     active_session: Option<SpendingSession>,
     entries: Vec<TransactionEntry>,
     #[serde(default)]
+    pending_authorization: Option<PendingAuthorization>,
+    #[serde(default)]
     proof_attempted_through: HashMap<String, u64>,
     #[serde(default)]
     archives: Vec<ArchiveMeta>,
@@ -339,6 +368,7 @@ impl Default for JournalState {
             version: JOURNAL_VERSION,
             active_session: None,
             entries: Vec::new(),
+            pending_authorization: None,
             proof_attempted_through: HashMap::new(),
             archives: Vec::new(),
             archived_session_spending: HashMap::new(),
@@ -362,7 +392,23 @@ fn migrate_journal(
     if state.version == JOURNAL_VERSION {
         return Ok((state, false));
     }
-    if matches!(state.version, 3 | 4) {
+    if state.version == 6 {
+        state.version = JOURNAL_VERSION;
+        return Ok((state, true));
+    }
+    if matches!(state.version, 3..=5) {
+        for entry in &mut state.entries {
+            entry.receipt_verification = if matches!(
+                entry.status,
+                TransactionStatus::MinedSuccess | TransactionStatus::MinedReverted
+            ) {
+                // Preserve previously charged costs and settlement status, but explicitly
+                // retain the fact that this older settlement is not newly trusted under RC1.
+                ReceiptVerification::LegacyUnverified
+            } else {
+                ReceiptVerification::Unverified
+            };
+        }
         state.version = JOURNAL_VERSION;
         return Ok((state, true));
     }
@@ -375,6 +421,7 @@ fn migrate_journal(
 
     let wallet_string = format!("{wallet:#x}");
     for entry in &mut state.entries {
+        entry.receipt_verification = ReceiptVerification::Unverified;
         entry.confirmations_required = confirmations_required;
         if entry.action == TransactionAction::SubmitProof {
             let contract = Address::from_str(&entry.contract)
@@ -397,6 +444,7 @@ fn migrate_journal(
                 .receipt_status
                 .unwrap_or(entry.status == TransactionStatus::MinedSuccess);
             entry.status = TransactionStatus::Unknown;
+            entry.receipt_verification = ReceiptVerification::Unverified;
             entry.last_known_cost_wei = entry.actual_cost_wei.take();
             entry.receipt_status = Some(previously_succeeded);
             entry.confirmations = 0;
@@ -448,11 +496,23 @@ impl TransactionJournal {
         )
     }
 
+    #[cfg(test)]
     fn open_with_history_telemetry(
         store: &ConfigStore,
         config: &AppConfig,
         wallet: Address,
         history_telemetry: Arc<HistoryTelemetry>,
+    ) -> Result<Self> {
+        Self::open_with_session_policy(store, config, wallet, history_telemetry, true, false)
+    }
+
+    fn open_with_session_policy(
+        store: &ConfigStore,
+        config: &AppConfig,
+        wallet: Address,
+        history_telemetry: Arc<HistoryTelemetry>,
+        authorize_new_session: bool,
+        force_new_session: bool,
     ) -> Result<Self> {
         let _open_timer = history_telemetry.timer(HistoryDuration::JournalOpen);
         if config.network != Network::Testnet {
@@ -465,8 +525,8 @@ impl TransactionJournal {
                 .context("decode transaction journal")?,
             None => JournalState::default(),
         };
-        let (state, migrated) = migrate_journal(state, wallet, config.transaction_confirmations)?;
-        validate_journal(&state)?;
+        let (mut state, mut migrated) =
+            migrate_journal(state, wallet, config.transaction_confirmations)?;
         let archive_validation = {
             let _archive_validation_timer =
                 history_telemetry.timer(HistoryDuration::ArchiveValidation);
@@ -476,6 +536,14 @@ impl TransactionJournal {
             history_telemetry.add(HistoryCounter::ArchiveValidationFailures, 1);
             return Err(error);
         }
+        migrated |= initialize_session_accounting(store, &mut state)?;
+        validate_journal(&state)?;
+        if state.pending_authorization.take().is_some() {
+            // The raw signature is never broadcast until its hash and full intent
+            // are persisted. An orphan reservation can therefore be retired on
+            // restart without refunding its cumulative maximum exposure.
+            migrated = true;
+        }
 
         let mut journal = Self {
             store: store.clone(),
@@ -484,6 +552,9 @@ impl TransactionJournal {
             history_telemetry: Arc::clone(&history_telemetry),
         };
         let has_unresolved = journal.has_unresolved();
+        if force_new_session && has_unresolved {
+            bail!("cannot start a new spending session while a transaction is unresolved");
+        }
         let has_active_entries = journal
             .state
             .active_session
@@ -495,6 +566,15 @@ impl TransactionJournal {
                     .iter()
                     .any(|entry| entry.session_id == session.id)
             });
+        let has_prior_authorization = !journal.state.entries.is_empty()
+            || !journal.state.archives.is_empty()
+            || journal
+                .state
+                .active_session
+                .as_ref()
+                .and_then(|session| session.authorized_exposure_wei.as_deref())
+                .and_then(|value| parse_decimal_wei(value).ok())
+                .is_some_and(|value| !value.is_zero());
         let mut resume_session = false;
         if limit.is_zero() {
             resume_session = journal
@@ -521,6 +601,15 @@ impl TransactionJournal {
                     || has_unresolved
                     || (!has_active_entries && session.wallet.is_empty()));
         }
+        if force_new_session {
+            resume_session = false;
+        }
+        if !limit.is_zero() && !resume_session && has_prior_authorization && !authorize_new_session
+        {
+            bail!(
+                "a previous spending session already has signed transaction authorizations; use `astatine mine --new-session` to explicitly begin a separate session"
+            );
+        }
         if resume_session {
             if !limit.is_zero()
                 && let Some(session) = &mut journal.state.active_session
@@ -534,6 +623,8 @@ impl TransactionJournal {
                 id: new_session_id(),
                 wallet: format!("{wallet:#x}"),
                 limit_wei: limit.to_string(),
+                authorized_exposure_wei: Some("0".to_owned()),
+                reported_actual_wei: Some("0".to_owned()),
                 closed: false,
             });
         }
@@ -588,38 +679,73 @@ impl TransactionJournal {
             })
     }
 
-    fn session_spent_or_reserved(&self) -> Result<U256> {
+    fn session_authorized_total(&self) -> Result<U256> {
         let session = self
             .state
             .active_session
             .as_ref()
             .context("transaction journal has no active spending session")?;
-        let archived = self
+        let persisted = parse_decimal_wei(
+            session
+                .authorized_exposure_wei
+                .as_deref()
+                .context("active session has no durable authorization counter")?,
+        )
+        .context("active session authorization counter is invalid")?;
+        let journaled = self
             .state
-            .archived_session_spending
-            .get(&session.id)
-            .map(|value| parse_decimal_wei(value))
-            .transpose()?
-            .unwrap_or(U256::ZERO);
-        self.state
             .entries
             .iter()
             .filter(|entry| entry.session_id == session.id)
-            .try_fold(archived, |total, entry| {
-                let amount = if entry.status.is_unresolved() {
-                    parse_decimal_wei(&entry.maximum_exposure_wei)?
-                } else {
-                    parse_decimal_wei(
-                        entry
-                            .actual_cost_wei
-                            .as_deref()
-                            .unwrap_or(&entry.maximum_exposure_wei),
-                    )?
-                };
+            .try_fold(U256::ZERO, |total, entry| {
                 total
-                    .checked_add(amount)
-                    .context("session spending total overflow")
-            })
+                    .checked_add(parse_decimal_wei(&entry.maximum_exposure_wei)?)
+                    .context("active journal authorization total overflow")
+            })?;
+        Ok(persisted.max(journaled))
+    }
+
+    fn session_reported_actual_spending(&self) -> Result<Option<U256>> {
+        let Some(session) = &self.state.active_session else {
+            return Ok(None);
+        };
+        let value = parse_decimal_wei(
+            session
+                .reported_actual_wei
+                .as_deref()
+                .context("active session has no RPC-reported actual-cost counter")?,
+        )
+        .context("active session RPC-reported actual-cost counter is invalid")?;
+        Ok(Some(value))
+    }
+
+    fn adjust_reported_actual_spending(
+        &mut self,
+        session_id: &str,
+        subtract: U256,
+        add: U256,
+    ) -> Result<()> {
+        let Some(session) = self
+            .state
+            .active_session
+            .as_mut()
+            .filter(|session| session.id == session_id)
+        else {
+            return Ok(());
+        };
+        let current = parse_decimal_wei(
+            session
+                .reported_actual_wei
+                .as_deref()
+                .context("active session has no RPC-reported actual-cost counter")?,
+        )?;
+        let adjusted = current
+            .checked_sub(subtract)
+            .context("RPC-reported actual-cost counter underflow")?
+            .checked_add(add)
+            .context("RPC-reported actual-cost counter overflow")?;
+        session.reported_actual_wei = Some(adjusted.to_string());
+        Ok(())
     }
 
     fn validate_exposure(
@@ -630,8 +756,11 @@ impl TransactionJournal {
         minimum_reserve: U256,
         confirmed_balance: U256,
     ) -> Result<U256> {
+        if intent.action == TransactionAction::ForwardReward {
+            bail!("{AUTOMATIC_REWARD_FORWARDING_DISABLED}");
+        }
         self.archive_settled()?;
-        if self.has_unresolved() {
+        if self.has_unresolved() || self.state.pending_authorization.is_some() {
             bail!("an earlier transaction has unresolved broadcast status; refusing a second send");
         }
         let journal_wallet = self
@@ -692,15 +821,9 @@ impl TransactionJournal {
         if parse_decimal_wei(&session.limit_wei)? != session_limit {
             bail!("active transaction journal spending limit does not match configuration");
         }
-        let gas_exposure = U256::from(request.gas_limit)
-            .checked_mul(request.max_fee_per_gas)
-            .context("maximum gas exposure overflow")?;
-        let maximum_exposure = request
-            .value
-            .checked_add(gas_exposure)
-            .context("maximum transaction exposure overflow")?;
+        let maximum_exposure = maximum_transaction_exposure(request)?;
         let session_total = self
-            .session_spent_or_reserved()?
+            .session_authorized_total()?
             .checked_add(maximum_exposure)
             .context("session spending total overflow")?;
         if session_total > session_limit {
@@ -734,6 +857,58 @@ impl TransactionJournal {
             bail!("transaction journal reached its entry limit; archive it before further mining");
         }
         Ok(maximum_exposure)
+    }
+
+    fn authorize_exposure(
+        &mut self,
+        request: &Eip1559Request,
+        intent: &TransactionIntent,
+        session_limit: U256,
+        minimum_reserve: U256,
+        confirmed_balance: U256,
+    ) -> Result<U256> {
+        let maximum_exposure = self.validate_exposure(
+            request,
+            intent,
+            session_limit,
+            minimum_reserve,
+            confirmed_balance,
+        )?;
+        let session_id = {
+            let session = self
+                .state
+                .active_session
+                .as_mut()
+                .context("transaction journal has no active spending session")?;
+            let authorized = parse_decimal_wei(
+                session
+                    .authorized_exposure_wei
+                    .as_deref()
+                    .context("active session has no durable authorization counter")?,
+            )?;
+            let updated = authorized
+                .checked_add(maximum_exposure)
+                .context("cumulative session authorization overflow")?;
+            session.authorized_exposure_wei = Some(updated.to_string());
+            session.id.clone()
+        };
+        self.state.pending_authorization = Some(PendingAuthorization {
+            session_id,
+            request_hash: format!("{:#x}", transaction_request_hash(request)),
+            maximum_exposure_wei: maximum_exposure.to_string(),
+        });
+        self.persist()
+            .context("persist maximum transaction authorization before signing")?;
+        Ok(maximum_exposure)
+    }
+
+    fn abandon_pending_authorization(&mut self) -> Result<()> {
+        if self.state.pending_authorization.take().is_some() {
+            // The authorization total intentionally remains charged. Only the
+            // unbound request marker is removed; no budget is refunded.
+            self.persist()?;
+        }
+        Ok(())
     }
 
     fn validate_forwarding_intent(
@@ -855,13 +1030,19 @@ impl TransactionJournal {
             confirmed_balance,
             confirmations_required,
         } = prepared;
-        let maximum_exposure = self.validate_exposure(
-            &request,
-            &intent,
-            session_limit,
-            minimum_reserve,
-            confirmed_balance,
-        )?;
+        if intent.action == TransactionAction::ForwardReward {
+            bail!("{AUTOMATIC_REWARD_FORWARDING_DISABLED}");
+        }
+        let maximum_exposure = maximum_transaction_exposure(&request)?;
+        if self.state.pending_authorization.is_none() {
+            self.authorize_exposure(
+                &request,
+                &intent,
+                session_limit,
+                minimum_reserve,
+                confirmed_balance,
+            )?;
+        }
         let session = self
             .state
             .active_session
@@ -869,6 +1050,17 @@ impl TransactionJournal {
             .context("transaction journal has no active spending session")?;
         let session_id = session.id.clone();
         let wallet = session.wallet.clone();
+        let authorization = self
+            .state
+            .pending_authorization
+            .as_ref()
+            .context("transaction has no persisted maximum-exposure authorization")?;
+        if authorization.session_id != session_id
+            || authorization.request_hash != format!("{:#x}", transaction_request_hash(&request))
+            || parse_decimal_wei(&authorization.maximum_exposure_wei)? != maximum_exposure
+        {
+            bail!("signed transaction does not match its persisted local authorization");
+        }
 
         let (proof_nonce, proof_hash, header_hex) = match intent.proof.as_ref() {
             Some(proof) => (
@@ -932,6 +1124,7 @@ impl TransactionJournal {
             gas_limit: request.gas_limit,
             maximum_exposure_wei: maximum_exposure.to_string(),
             status: TransactionStatus::Prepared,
+            receipt_verification: ReceiptVerification::Unverified,
             actual_cost_wei: None,
             last_known_cost_wei: None,
             outcome: None,
@@ -982,6 +1175,7 @@ impl TransactionJournal {
             source.reward_forward_status = Some(RewardForwardingStatus::Signed);
             source.reward_forward_error = None;
         }
+        self.state.pending_authorization = None;
         self.persist()
     }
 
@@ -1034,12 +1228,14 @@ impl TransactionJournal {
                 || entry.receipt_block != Some(receipt.block_number)
                 || entry.receipt_block_hash.as_deref() != Some(block_hash.as_str())
                 || entry.receipt_status != Some(receipt.status)
+                || entry.receipt_verification != ReceiptVerification::TrustedRpcChecked
                 || entry.actual_cost_wei.is_some();
             let confirmations_changed = entry.confirmations != confirmations;
             let crossed_required_confirmations = entry.confirmations
                 < u64::from(entry.confirmations_required)
                 && confirmations >= u64::from(entry.confirmations_required);
             entry.status = TransactionStatus::Included;
+            entry.receipt_verification = ReceiptVerification::TrustedRpcChecked;
             entry.actual_cost_wei = None;
             entry.outcome = Some(outcome);
             entry.receipt_block = Some(receipt.block_number);
@@ -1088,15 +1284,27 @@ impl TransactionJournal {
         actual_cost: U256,
         outcome: String,
     ) -> Result<()> {
-        let (source_hash, ineligible_proof_hash) = {
+        let (source_hash, ineligible_proof_hash, session_id, previous_actual) = {
             let entry = self.entry_mut(hash)?;
             if confirmations < u64::from(entry.confirmations_required) {
                 bail!("cannot settle a receipt before the configured confirmation threshold");
+            }
+            if entry.receipt_verification != ReceiptVerification::TrustedRpcChecked {
+                bail!(
+                    "cannot settle a receipt before locally checking it against the signed transaction intent"
+                );
             }
             if receipt.status && outcome == "receipt-event-unverified" {
                 bail!("cannot settle a successful receipt before its canonical event is verified");
             }
             let action = entry.action;
+            let session_id = entry.session_id.clone();
+            let previous_actual = entry
+                .actual_cost_wei
+                .as_deref()
+                .map(parse_decimal_wei)
+                .transpose()?
+                .unwrap_or(U256::ZERO);
             let ineligible_proof_hash = (action == TransactionAction::SubmitProof
                 && entry.reward_forward_destination.is_some()
                 && (!receipt.status || outcome != "candidate-updated"))
@@ -1121,8 +1329,14 @@ impl TransactionJournal {
                         .and_then(|value| B256::from_str(value).ok())
                 })
                 .flatten();
-            (source_hash, ineligible_proof_hash)
+            (
+                source_hash,
+                ineligible_proof_hash,
+                session_id,
+                previous_actual,
+            )
         };
+        self.adjust_reported_actual_spending(&session_id, previous_actual, actual_cost)?;
         if let Some(source_hash) = source_hash {
             set_forwarding_source_status(
                 &mut self.state,
@@ -1235,20 +1449,8 @@ impl TransactionJournal {
         Ok(())
     }
 
-    fn update_reward_forward_status(
-        &mut self,
-        source_proof_hash: B256,
-        status: RewardForwardingStatus,
-        reason: Option<String>,
-    ) -> Result<()> {
-        if set_forwarding_source_status(&mut self.state, source_proof_hash, status, reason)? {
-            self.persist()?;
-        }
-        Ok(())
-    }
-
     fn mark_uncertain(&mut self, hash: B256) -> Result<()> {
-        let (action, contract, window_id, forward_source_hash) = {
+        let (action, contract, window_id, forward_source_hash, session_id, actual_to_reverse) = {
             let entry = self.entry_mut(hash)?;
             let data = (
                 entry.action,
@@ -1258,8 +1460,20 @@ impl TransactionJournal {
                     .forward_source_proof_hash
                     .as_deref()
                     .and_then(|value| B256::from_str(value).ok()),
+                entry.session_id.clone(),
+                if entry.receipt_verification == ReceiptVerification::TrustedRpcChecked {
+                    entry
+                        .actual_cost_wei
+                        .as_deref()
+                        .map(parse_decimal_wei)
+                        .transpose()?
+                        .unwrap_or(U256::ZERO)
+                } else {
+                    U256::ZERO
+                },
             );
             entry.status = TransactionStatus::Unknown;
+            entry.receipt_verification = ReceiptVerification::Unverified;
             entry.last_known_cost_wei = entry
                 .actual_cost_wei
                 .take()
@@ -1267,6 +1481,9 @@ impl TransactionJournal {
             entry.confirmations = 0;
             data
         };
+        // Uncertainty restores only pending balance exposure. The active
+        // session's cumulative maximum authorization is intentionally untouched.
+        self.adjust_reported_actual_spending(&session_id, actual_to_reverse, U256::ZERO)?;
         let contract_address =
             Address::from_str(&contract).context("uncertain transaction contract is invalid")?;
         if action == TransactionAction::SubmitProof
@@ -1630,6 +1847,7 @@ impl TransactionJournal {
             .next_archive_sequence
             .checked_add(1)
             .context("archive sequence overflow")?;
+        initialize_session_accounting(&self.store, &mut self.state)?;
         self.persist()?;
         Ok(entries.len())
     }
@@ -1644,27 +1862,6 @@ impl TransactionJournal {
         self.persist()
     }
 
-    fn ensure_wallet_session(&mut self, wallet: Address, limit: U256) -> Result<()> {
-        let matches = self.state.active_session.as_ref().is_some_and(|session| {
-            !session.closed
-                && session.wallet.eq_ignore_ascii_case(&format!("{wallet:#x}"))
-                && parse_decimal_wei(&session.limit_wei).ok() == Some(limit)
-        });
-        if matches {
-            return Ok(());
-        }
-        if self.has_unresolved() {
-            bail!("cannot start a new wallet session while transaction exposure is unresolved");
-        }
-        self.state.active_session = Some(SpendingSession {
-            id: new_session_id(),
-            wallet: format!("{wallet:#x}"),
-            limit_wei: limit.to_string(),
-            closed: false,
-        });
-        self.persist()
-    }
-
     fn require_wallet_session(&self, wallet: Address) -> Result<()> {
         let session = self
             .state
@@ -1673,96 +1870,6 @@ impl TransactionJournal {
             .context("transaction journal has no active spending session")?;
         if session.wallet != format!("{wallet:#x}") {
             bail!("active spending session belongs to a different wallet");
-        }
-        Ok(())
-    }
-
-    fn validate_reward_forward_resume_destination(&self, destination: Address) -> Result<()> {
-        for entry in &self.state.entries {
-            if entry.action != TransactionAction::SubmitProof
-                || !matches!(
-                    entry.reward_forward_status,
-                    Some(
-                        RewardForwardingStatus::AwaitingReward
-                            | RewardForwardingStatus::VerifiedEligible
-                            | RewardForwardingStatus::Signed
-                            | RewardForwardingStatus::Broadcast
-                            | RewardForwardingStatus::ReceiptPending
-                            | RewardForwardingStatus::UnknownOutcome
-                            | RewardForwardingStatus::PolicyBlocked
-                            | RewardForwardingStatus::Reverted
-                    )
-                )
-            {
-                continue;
-            }
-            let authorized = entry
-                .reward_forward_destination
-                .as_deref()
-                .context("pending reward forwarding has no persisted destination")
-                .and_then(|value| {
-                    Address::from_str(value).context("pending reward destination is invalid")
-                })?;
-            if authorized != destination {
-                bail!(
-                    "a previously authorized reward for node {} window {} is pending for destination {authorized:#x}; resume with that same destination before selecting another",
-                    entry.node_id,
-                    entry.window_id
-                );
-            }
-        }
-        Ok(())
-    }
-
-    fn resume_reward_forwarding(&mut self, destination: Address) -> Result<()> {
-        let mut changed = false;
-        for index in 0..self.state.entries.len() {
-            let entry = &self.state.entries[index];
-            if entry.action != TransactionAction::SubmitProof
-                || entry.reward_forward_destination.as_deref()
-                    != Some(format!("{destination:#x}").as_str())
-                || !entry.reward_confirmed
-                || !entry
-                    .reward_outcome
-                    .as_deref()
-                    .is_some_and(|outcome| outcome.starts_with("reward-paid:"))
-                || !matches!(
-                    entry.reward_forward_status,
-                    Some(RewardForwardingStatus::PolicyBlocked | RewardForwardingStatus::Reverted)
-                )
-            {
-                continue;
-            }
-            let payout_id = reward_payout_id(
-                Address::from_str(&entry.contract)
-                    .context("forwarding source proof contract is invalid")?,
-                entry.window_id,
-                Address::from_str(&entry.wallet)
-                    .context("forwarding source proof wallet is invalid")?,
-            );
-            let attempts = self
-                .state
-                .entries
-                .iter()
-                .filter(|candidate| {
-                    candidate.action == TransactionAction::ForwardReward
-                        && candidate.forward_payout_id.as_deref() == Some(payout_id.as_str())
-                })
-                .count();
-            let entry = &mut self.state.entries[index];
-            if attempts >= 2 {
-                entry.reward_forward_status = Some(RewardForwardingStatus::PolicyBlocked);
-                entry.reward_forward_error = Some(
-                    "automatic retry limit reached after confirmed transfer reverts".to_owned(),
-                );
-            } else {
-                entry.reward_forward_status = Some(RewardForwardingStatus::VerifiedEligible);
-                entry.reward_forward_error = None;
-            }
-            changed = true;
-        }
-        if changed {
-            self.persist()?;
         }
         Ok(())
     }
@@ -1813,8 +1920,6 @@ pub struct TransactionManager {
     reward_scan_retry_at: Option<Instant>,
     reward_scan_retry_attempts: u8,
     receipt_reward_service_errors: u64,
-    reward_forward_destination: Option<Address>,
-    reward_forward_reported_errors: HashSet<String>,
     current_process_proof_hashes: HashSet<B256>,
     mined_rewards_by_window: HashMap<MinedRewardKey, U256>,
     mined_rewards_total: U256,
@@ -1825,11 +1930,6 @@ pub struct ConfirmedAction {
     pub transaction_hash: B256,
     pub receipt: TransactionReceipt,
     pub outcome: String,
-}
-
-enum SendOutcome {
-    Confirmed(ConfirmedAction),
-    Broadcast(B256),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1849,7 +1949,8 @@ pub struct TransactionActivity {
 
 #[derive(Clone, Debug, Default)]
 pub struct TransactionDashboardState {
-    pub session_exposure: Option<U256>,
+    pub authorization_used: Option<U256>,
+    pub actual_rpc_cost: Option<U256>,
     pub mined_rewards: U256,
     pub activities: Vec<TransactionActivity>,
 }
@@ -1967,6 +2068,7 @@ impl TransactionManager {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn open_with_history_telemetry(
         store: &ConfigStore,
         config: &AppConfig,
@@ -1974,11 +2076,52 @@ impl TransactionManager {
         ast_token: Address,
         history_telemetry: Arc<HistoryTelemetry>,
     ) -> Result<Self> {
-        let journal = TransactionJournal::open_with_history_telemetry(
+        Self::open_with_session_policy(
+            store,
+            config,
+            wallet,
+            ast_token,
+            Arc::clone(&history_telemetry),
+            true,
+            false,
+        )
+    }
+
+    pub(crate) fn open_with_session_authorization(
+        store: &ConfigStore,
+        config: &AppConfig,
+        wallet: Address,
+        ast_token: Address,
+        history_telemetry: Arc<HistoryTelemetry>,
+        authorize_new_session: bool,
+    ) -> Result<Self> {
+        Self::open_with_session_policy(
+            store,
+            config,
+            wallet,
+            ast_token,
+            history_telemetry,
+            authorize_new_session,
+            authorize_new_session,
+        )
+    }
+
+    fn open_with_session_policy(
+        store: &ConfigStore,
+        config: &AppConfig,
+        wallet: Address,
+        ast_token: Address,
+        history_telemetry: Arc<HistoryTelemetry>,
+        authorize_new_session: bool,
+        force_new_session: bool,
+    ) -> Result<Self> {
+        let journal = TransactionJournal::open_with_session_policy(
             store,
             config,
             wallet,
             Arc::clone(&history_telemetry),
+            authorize_new_session,
+            force_new_session,
         )?;
         Ok(Self {
             journal,
@@ -1997,8 +2140,6 @@ impl TransactionManager {
             reward_scan_retry_at: None,
             reward_scan_retry_attempts: 0,
             receipt_reward_service_errors: 0,
-            reward_forward_destination: None,
-            reward_forward_reported_errors: HashSet::new(),
             current_process_proof_hashes: HashSet::new(),
             mined_rewards_by_window: HashMap::new(),
             mined_rewards_total: U256::ZERO,
@@ -2015,6 +2156,7 @@ impl TransactionManager {
         let mut unresolved = 0_u64;
         let mut settled_canonical_pending = 0_u64;
         let mut reward_pending = 0_u64;
+        let mut legacy_unverified_settled = 0_u64;
         for entry in &self.journal.state.entries {
             match entry.status {
                 TransactionStatus::Prepared => prepared += 1,
@@ -2035,6 +2177,13 @@ impl TransactionManager {
             {
                 settled_canonical_pending += 1;
             }
+            if matches!(
+                entry.status,
+                TransactionStatus::MinedSuccess | TransactionStatus::MinedReverted
+            ) && entry.receipt_verification == ReceiptVerification::LegacyUnverified
+            {
+                legacy_unverified_settled += 1;
+            }
             if entry.action == TransactionAction::SubmitProof
                 && entry.outcome.as_deref() == Some("candidate-updated")
                 && !entry.reward_confirmed
@@ -2050,7 +2199,7 @@ impl TransactionManager {
             .map(|archive| u64::from(archive.entry_count))
             .sum::<u64>();
         format!(
-            "history entries={} prepared={} broadcast={} unknown={} included={} settled_success={} reverted={} unresolved={} settled_canonical_pending={} reward_pending={} archives={} archived_entries={} {}",
+            "history entries={} prepared={} broadcast={} unknown={} included={} settled_success={} reverted={} unresolved={} active_legacy_unverified_settled={} settled_canonical_pending={} reward_pending={} archives={} archived_entries={} {}",
             self.journal.state.entries.len(),
             prepared,
             broadcast,
@@ -2059,6 +2208,7 @@ impl TransactionManager {
             settled_success,
             reverted,
             unresolved,
+            legacy_unverified_settled,
             settled_canonical_pending,
             reward_pending,
             self.journal.state.archives.len(),
@@ -2069,6 +2219,40 @@ impl TransactionManager {
 
     pub(crate) fn mined_rewards_total(&self) -> U256 {
         self.mined_rewards_total
+    }
+
+    pub(crate) fn legacy_unverified_settled_count(&self) -> Result<usize> {
+        let mut count = self
+            .journal
+            .state
+            .entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.status,
+                    TransactionStatus::MinedSuccess | TransactionStatus::MinedReverted
+                ) && entry.receipt_verification == ReceiptVerification::LegacyUnverified
+            })
+            .count();
+        for archive_meta in &self.journal.state.archives {
+            let contents = self
+                .journal
+                .store
+                .read_transaction_archive(&archive_meta.file_name)?;
+            let archive: JournalArchive =
+                serde_json::from_slice(&contents).context("decode transaction archive")?;
+            count += archive
+                .entries
+                .iter()
+                .filter(|entry| {
+                    matches!(
+                        entry.status,
+                        TransactionStatus::MinedSuccess | TransactionStatus::MinedReverted
+                    ) && entry.receipt_verification == ReceiptVerification::LegacyUnverified
+                })
+                .count();
+        }
+        Ok(count)
     }
 
     fn set_mined_reward(&mut self, key: MinedRewardKey, payout: Option<U256>) -> Result<()> {
@@ -2172,41 +2356,29 @@ impl TransactionManager {
         &mut self,
         destination: Option<Address>,
     ) -> Result<()> {
-        let Some(destination) = destination else {
-            self.reward_forward_destination = None;
-            if self.journal.state.entries.iter().any(|entry| {
-                entry.action == TransactionAction::SubmitProof
-                    && matches!(
-                        entry.reward_forward_status,
-                        Some(
-                            RewardForwardingStatus::AwaitingReward
-                                | RewardForwardingStatus::VerifiedEligible
-                                | RewardForwardingStatus::Signed
-                                | RewardForwardingStatus::Broadcast
-                                | RewardForwardingStatus::ReceiptPending
-                                | RewardForwardingStatus::UnknownOutcome
-                                | RewardForwardingStatus::PolicyBlocked
-                                | RewardForwardingStatus::Reverted
-                        )
-                    )
-            }) {
-                self.report_warning(
-                    "a previously authorized reward forwarding remains pending; restart mining with the same `--send-rewards-to` destination to resume it",
-                );
-            }
-            return Ok(());
-        };
-        if destination.is_zero() || destination == self.wallet {
-            bail!("reward destination must be nonzero and different from the mining wallet");
+        if destination.is_some() {
+            bail!("{AUTOMATIC_REWARD_FORWARDING_DISABLED}");
         }
-        self.journal
-            .validate_reward_forward_resume_destination(destination)?;
-        self.reward_forward_destination = Some(destination);
-        self.journal.resume_reward_forwarding(destination)?;
-        self.report_info(format!(
-            "reward forwarding enabled for this invocation → {:#x}",
-            destination
-        ));
+        if self.journal.state.entries.iter().any(|entry| {
+            entry.action == TransactionAction::SubmitProof
+                && matches!(
+                    entry.reward_forward_status,
+                    Some(
+                        RewardForwardingStatus::AwaitingReward
+                            | RewardForwardingStatus::VerifiedEligible
+                            | RewardForwardingStatus::Signed
+                            | RewardForwardingStatus::Broadcast
+                            | RewardForwardingStatus::ReceiptPending
+                            | RewardForwardingStatus::UnknownOutcome
+                            | RewardForwardingStatus::PolicyBlocked
+                            | RewardForwardingStatus::Reverted
+                    )
+                )
+        }) {
+            self.report_warning(
+                "a legacy automatic AST forwarding intent remains in the journal; Testnet.13 will only monitor existing transfers and will not sign or broadcast new ones",
+            );
+        }
         Ok(())
     }
 
@@ -2271,17 +2443,27 @@ impl TransactionManager {
         let Some(sink) = &self.dashboard_sink else {
             return;
         };
-        let session_exposure = match self.session_exposure() {
+        let authorization_used = match self.authorization_used() {
             Ok(exposure) => exposure,
             Err(error) => {
                 self.report_warning(format!(
-                    "dashboard could not read transaction session exposure: {error:#}"
+                    "dashboard could not read cumulative transaction authorization: {error:#}"
+                ));
+                None
+            }
+        };
+        let actual_rpc_cost = match self.actual_rpc_cost() {
+            Ok(cost) => cost,
+            Err(error) => {
+                self.report_warning(format!(
+                    "dashboard could not read RPC-reported transaction costs: {error:#}"
                 ));
                 None
             }
         };
         sink(TransactionDashboardState {
-            session_exposure,
+            authorization_used,
+            actual_rpc_cost,
             mined_rewards: self.mined_rewards_total,
             activities: self.dashboard_activities(),
         });
@@ -2352,7 +2534,7 @@ impl TransactionManager {
             return Ok(());
         }
         let latest_block = latest_snapshot.number;
-        let mut canonical_blocks = HashMap::from([(latest_block, latest_snapshot.hash)]);
+        let mut canonical_blocks = HashMap::new();
         let mut journal_dirty = false;
         for entry in entries {
             let hash = entry_hash(&entry)?;
@@ -2400,7 +2582,7 @@ impl TransactionManager {
                     Ok(None) if entry.status == TransactionStatus::Included => {
                         self.journal.mark_uncertain(hash)?;
                         self.report_warning(format!(
-                            "included transaction {hash:#x} is no longer returned by RPC; maximum exposure restored"
+                            "included transaction {hash:#x} is no longer returned by the selected RPC; pending maximum exposure restored, session authorization remains charged"
                         ));
                     }
                     Ok(None) => {}
@@ -2460,7 +2642,7 @@ impl TransactionManager {
             if latest_block < block_number {
                 self.journal.mark_uncertain(hash)?;
                 self.report_warning(format!(
-                    "latest canonical head {latest_block} is behind settled receipt block {block_number} for {hash:#x}; exposure restored for read-only reorg recovery"
+                    "latest canonical head {latest_block} is behind settled receipt block {block_number} for {hash:#x}; pending maximum exposure restored for read-only reorg recovery, session authorization remains charged"
                 ));
                 continue;
             }
@@ -2493,21 +2675,21 @@ impl TransactionManager {
                             .await?;
                         if matches!(progress, ReceiptProgress::Uncertain) {
                             self.report_warning(format!(
-                                "transaction {hash:#x} reorged; maximum exposure restored"
+                                "transaction {hash:#x} could not be confirmed as canonical; pending maximum exposure restored, session authorization remains charged"
                             ));
                         }
                     }
                     Ok(None) | Err(_) => {
                         self.journal.mark_uncertain(hash)?;
                         self.report_warning(format!(
-                            "settled transaction {hash:#x} is no longer canonical; maximum exposure restored"
+                            "settled transaction {hash:#x} is no longer canonical; pending maximum exposure restored, session authorization remains charged"
                         ));
                     }
                 },
                 Err(error) => {
                     self.journal.mark_uncertain(hash)?;
                     self.report_warning(format!(
-                        "cannot verify canonical block for {hash:#x}; maximum exposure restored: {error:#}"
+                        "cannot verify canonical block for {hash:#x}; pending maximum exposure restored and session authorization remains charged: {error:#}"
                     ));
                 }
             }
@@ -2516,10 +2698,6 @@ impl TransactionManager {
         let archived = self.journal.archive_settled()?;
         if journal_dirty && archived == 0 {
             self.journal.persist()?;
-        }
-        if !self.journal.has_unresolved() && !self.session_limit.is_zero() {
-            self.journal
-                .ensure_wallet_session(self.wallet, self.session_limit)?;
         }
         self.publish_dashboard_state();
         Ok(())
@@ -2558,7 +2736,7 @@ impl TransactionManager {
                     .update_reward_confirmations(entry_hash(entry)?, confirmations)?;
                 if newly_confirmed {
                     self.report_info(format!(
-                        "node {} window {} reward payout evidence reached {} confirmations: {}",
+                        "node {} window {} selected-RPC reward evidence reached {} confirmations (not independently authenticated): {}",
                         entry.node_id,
                         entry.window_id,
                         confirmations,
@@ -2595,6 +2773,33 @@ impl TransactionManager {
         let hash = entry_hash(entry)?;
         if receipt.transaction_hash != hash {
             bail!("RPC returned a receipt for a different transaction hash");
+        }
+        let transaction = match client.transaction_details(hash).await {
+            Ok(Some(transaction)) => transaction,
+            Ok(None) => {
+                self.journal.mark_uncertain(hash)?;
+                self.publish_dashboard_state();
+                self.report_warning(format!(
+                    "receipt for {hash:#x} has no matching transaction details from the selected RPC; maximum authorization remains charged"
+                ));
+                return Ok(ReceiptProgress::Uncertain);
+            }
+            Err(error) => {
+                self.journal.mark_uncertain(hash)?;
+                self.publish_dashboard_state();
+                self.report_warning(format!(
+                    "trusted RPC transaction-details request failed for {hash:#x}; maximum authorization remains charged: {error:#}"
+                ));
+                return Ok(ReceiptProgress::Uncertain);
+            }
+        };
+        if let Err(error) = validate_transaction_binding(entry, &transaction, receipt) {
+            self.journal.mark_uncertain(hash)?;
+            self.publish_dashboard_state();
+            self.report_warning(format!(
+                "selected RPC transaction details do not match the signed journal intent for {hash:#x}; maximum authorization remains charged: {error:#}"
+            ));
+            return Ok(ReceiptProgress::Uncertain);
         }
         let confirmations = match client
             .receipt_confirmations(receipt.block_number, receipt.block_hash, latest_block)
@@ -2754,195 +2959,6 @@ impl TransactionManager {
             return Ok(false);
         }
         self.schedule_reward_reconciliation(client, snapshot)
-    }
-
-    pub(crate) async fn service_reward_forwarding(
-        &mut self,
-        client: &NetworkClient,
-        snapshot: &ReadSnapshot,
-        signer: &SigningKey,
-    ) -> Result<bool> {
-        let Some(destination) = self.reward_forward_destination else {
-            return Ok(false);
-        };
-        if !client.can_broadcast()
-            || !client.verification.token_verified
-            || self.journal.has_unresolved()
-        {
-            return Ok(false);
-        }
-        let Some(ast_balance) = snapshot.ast_balance else {
-            self.report_forwarding_warning(
-                "AST balance is unavailable; verified reward forwarding remains pending",
-            );
-            return Ok(false);
-        };
-        let sources = self.journal.state.entries.clone();
-        for source in sources {
-            if source.action != TransactionAction::SubmitProof
-                || source.reward_forward_destination.as_deref()
-                    != Some(format!("{destination:#x}").as_str())
-                || source.reward_forward_status != Some(RewardForwardingStatus::VerifiedEligible)
-                || !source.reward_confirmed
-            {
-                continue;
-            }
-            let payout_id = reward_payout_id(
-                Address::from_str(&source.contract)
-                    .context("forwarding source proof contract is invalid")?,
-                source.window_id,
-                Address::from_str(&source.wallet)
-                    .context("forwarding source proof wallet is invalid")?,
-            );
-            let attempts = self
-                .journal
-                .state
-                .entries
-                .iter()
-                .filter(|entry| {
-                    entry.action == TransactionAction::ForwardReward
-                        && entry.forward_payout_id.as_deref() == Some(payout_id.as_str())
-                })
-                .collect::<Vec<_>>();
-            if self.journal.forwarding_payout_in_archives(&payout_id)?
-                || attempts
-                    .iter()
-                    .any(|entry| entry.status != TransactionStatus::MinedReverted)
-            {
-                continue;
-            }
-            if attempts.len() >= 2 {
-                self.journal.update_reward_forward_status(
-                    entry_hash(&source)?,
-                    RewardForwardingStatus::PolicyBlocked,
-                    Some(
-                        "automatic retry limit reached after confirmed transfer reverts".to_owned(),
-                    ),
-                )?;
-                continue;
-            }
-            let amount = parse_decimal_wei(
-                source
-                    .reward_outcome
-                    .as_deref()
-                    .and_then(|outcome| outcome.strip_prefix("reward-paid:"))
-                    .context("eligible reward has no verified payout amount")?,
-            )?;
-            if ast_balance < amount {
-                let reason = format!(
-                    "verified AST wallet balance {} is below this reward's exact payout {} AST",
-                    format_ast_wei(ast_balance),
-                    format_ast_wei(amount)
-                );
-                self.journal.update_reward_forward_status(
-                    entry_hash(&source)?,
-                    RewardForwardingStatus::PolicyBlocked,
-                    Some(reason.clone()),
-                )?;
-                self.report_forwarding_warning(reason);
-                continue;
-            }
-
-            let source_hash = entry_hash(&source)?;
-            let source_contract = Address::from_str(&source.contract)
-                .context("forwarding source miner contract is invalid")?;
-            let reward_block = source
-                .reward_block
-                .context("eligible reward has no canonical block number")?;
-            let reward_block_hash = B256::from_str(
-                source
-                    .reward_block_hash
-                    .as_deref()
-                    .context("eligible reward has no canonical block hash")?,
-            )
-            .context("eligible reward has an invalid canonical block hash")?;
-            let forwarding = ForwardingIntent {
-                payout_id,
-                source_proof_hash: source_hash,
-                source_contract,
-                destination,
-                amount,
-                reward_block,
-                reward_block_hash,
-            };
-            let calldata = crate::contracts::IERC20Read::transferCall {
-                to: destination,
-                amount,
-            }
-            .abi_encode();
-            let send_result = self
-                .send(
-                    client,
-                    signer,
-                    TransactionIntent {
-                        contract: self.ast_token,
-                        node_id: source.node_id,
-                        window_id: source.window_id,
-                        action: TransactionAction::ForwardReward,
-                        proof: None,
-                        reward_destination: None,
-                        forwarding: Some(forwarding),
-                    },
-                    U256::ZERO,
-                    calldata,
-                )
-                .await;
-            match send_result {
-                Ok(SendOutcome::Broadcast(hash)) => {
-                    let message = format!(
-                        "node {:02} window {} · forwarding {} AST to {:#x} · transaction {hash:#x} awaiting confirmation",
-                        source.node_id,
-                        source.window_id,
-                        format_ast_wei(amount),
-                        destination
-                    );
-                    self.report_info(message);
-                    self.publish_dashboard_state();
-                    return Ok(true);
-                }
-                Ok(SendOutcome::Confirmed(_)) => {
-                    bail!("reward forwarding transaction unexpectedly waited for its receipt")
-                }
-                Err(error) if self.journal.has_unresolved() => {
-                    self.report_forwarding_warning(format!(
-                        "reward forwarding outcome is journaled and requires recovery: {error:#}"
-                    ));
-                    self.publish_dashboard_state();
-                    return Ok(false);
-                }
-                Err(error) if is_transient_rpc_error(&error) => {
-                    self.report_forwarding_warning(format!(
-                        "reward forwarding preflight is temporarily unavailable: {error:#}"
-                    ));
-                    return Ok(false);
-                }
-                Err(error) if transaction_policy_refusal(&error).is_some() => {
-                    let reason = format!("reward forwarding is policy-blocked: {error:#}");
-                    self.journal.update_reward_forward_status(
-                        source_hash,
-                        RewardForwardingStatus::PolicyBlocked,
-                        Some(reason.clone()),
-                    )?;
-                    self.report_forwarding_warning(reason);
-                }
-                Err(error) if is_stale_transaction_preflight(&error) => {
-                    self.report_forwarding_warning(format!(
-                        "reward forwarding is waiting for fresh verified work: {error:#}"
-                    ));
-                    return Ok(false);
-                }
-                Err(error) => {
-                    let reason = format!("reward forwarding is policy-blocked: {error:#}");
-                    self.journal.update_reward_forward_status(
-                        source_hash,
-                        RewardForwardingStatus::PolicyBlocked,
-                        Some(reason.clone()),
-                    )?;
-                    self.report_forwarding_warning(reason);
-                }
-            }
-        }
-        Ok(false)
     }
 
     async fn service_reward_reconciliation_while_receipt_pending(
@@ -3226,6 +3242,22 @@ impl TransactionManager {
                 Ok(false)
             }
             RewardScanBatchOutput::Scanned { snapshot, results } => {
+                #[cfg(test)]
+                for result in &results {
+                    match result {
+                        Ok(output) => eprintln!(
+                            "test reward scan key={} cursor={:?} evidence={:?}",
+                            output.key,
+                            output.cursor,
+                            output
+                                .evidence
+                                .iter()
+                                .map(|evidence| (&evidence.wallet, &evidence.outcome))
+                                .collect::<Vec<_>>()
+                        ),
+                        Err(error) => eprintln!("test reward scan error: {error:#}"),
+                    }
+                }
                 let mut changed = false;
                 let mut errors = 0_u64;
                 let mut has_evidence = false;
@@ -3312,33 +3344,26 @@ impl TransactionManager {
             nonce: submission.nonce,
         }
         .abi_encode();
-        match self
-            .send(
-                client,
-                signer,
-                TransactionIntent {
-                    contract: submission.contract,
-                    node_id: submission.node_id,
-                    window_id: submission.window_id,
-                    action: TransactionAction::SubmitProof,
-                    proof: Some(ProofData {
-                        nonce: submission.nonce,
-                        work_hash: submission.work_hash,
-                        header: submission.header,
-                    }),
-                    reward_destination: self.reward_forward_destination,
-                    forwarding: None,
-                },
-                U256::from(SUBMISSION_FEE_WEI),
-                data,
-            )
-            .await?
-        {
-            SendOutcome::Confirmed(action) => Ok(action),
-            SendOutcome::Broadcast(_) => {
-                bail!("proof submission unexpectedly returned before receipt verification")
-            }
-        }
+        self.send(
+            client,
+            signer,
+            TransactionIntent {
+                contract: submission.contract,
+                node_id: submission.node_id,
+                window_id: submission.window_id,
+                action: TransactionAction::SubmitProof,
+                proof: Some(ProofData {
+                    nonce: submission.nonce,
+                    work_hash: submission.work_hash,
+                    header: submission.header,
+                }),
+                reward_destination: None,
+                forwarding: None,
+            },
+            U256::from(SUBMISSION_FEE_WEI),
+            data,
+        )
+        .await
     }
 
     pub async fn finalize_window(
@@ -3352,36 +3377,22 @@ impl TransactionManager {
         if signer_address(signer) != self.wallet {
             bail!("unlocked signer does not match the configured wallet");
         }
-        match self
-            .send(
-                client,
-                signer,
-                TransactionIntent {
-                    contract,
-                    node_id,
-                    window_id,
-                    action: TransactionAction::FinalizeWindow,
-                    proof: None,
-                    reward_destination: None,
-                    forwarding: None,
-                },
-                U256::ZERO,
-                AstatineMinerRead::finalizeWindowCall {}.abi_encode(),
-            )
-            .await?
-        {
-            SendOutcome::Confirmed(action) => Ok(action),
-            SendOutcome::Broadcast(_) => {
-                bail!("window finalization unexpectedly returned before receipt verification")
-            }
-        }
-    }
-
-    fn report_forwarding_warning(&mut self, message: impl Into<String>) {
-        let message = message.into();
-        if self.reward_forward_reported_errors.insert(message.clone()) {
-            self.report_warning(message);
-        }
+        self.send(
+            client,
+            signer,
+            TransactionIntent {
+                contract,
+                node_id,
+                window_id,
+                action: TransactionAction::FinalizeWindow,
+                proof: None,
+                reward_destination: None,
+                forwarding: None,
+            },
+            U256::ZERO,
+            AstatineMinerRead::finalizeWindowCall {}.abi_encode(),
+        )
+        .await
     }
 
     pub fn close_session(&mut self) -> Result<()> {
@@ -3393,8 +3404,8 @@ impl TransactionManager {
             return Ok(U256::ZERO);
         }
         self.session_limit
-            .checked_sub(self.journal.session_spent_or_reserved()?)
-            .context("active session exposure exceeds configured spending limit")
+            .checked_sub(self.journal.session_authorized_total()?)
+            .context("cumulative session authorization exceeds the configured cap")
     }
 
     pub fn proof_attempted(&self, contract: Address, window_id: u64) -> bool {
@@ -3410,11 +3421,15 @@ impl TransactionManager {
             .copied()
     }
 
-    pub fn session_exposure(&self) -> Result<Option<U256>> {
+    pub fn authorization_used(&self) -> Result<Option<U256>> {
         if self.journal.state.active_session.is_none() {
             return Ok(None);
         }
-        self.journal.session_spent_or_reserved().map(Some)
+        self.journal.session_authorized_total().map(Some)
+    }
+
+    pub fn actual_rpc_cost(&self) -> Result<Option<U256>> {
+        self.journal.session_reported_actual_spending()
     }
 
     async fn send(
@@ -3424,7 +3439,10 @@ impl TransactionManager {
         intent: TransactionIntent,
         value: U256,
         data: Vec<u8>,
-    ) -> Result<SendOutcome> {
+    ) -> Result<ConfirmedAction> {
+        if intent.action == TransactionAction::ForwardReward {
+            bail!("{AUTOMATIC_REWARD_FORWARDING_DISABLED}");
+        }
         if !client.can_broadcast() || client.manifest.chain_id != self.chain_id {
             bail!("transaction signing is disabled outside the approved Injective Testnet profile");
         }
@@ -3558,7 +3576,7 @@ impl TransactionManager {
             value,
             data,
         };
-        let maximum_exposure = self.journal.validate_exposure(
+        let maximum_exposure = self.journal.authorize_exposure(
             &request,
             &intent,
             self.session_limit,
@@ -3568,11 +3586,19 @@ impl TransactionManager {
         let node_id = intent.node_id;
         let window_id = intent.window_id;
         let action = intent.action;
-        let signed = sign_eip1559(signer, &request)?;
+        let signed = match sign_eip1559(signer, &request) {
+            Ok(signed) => signed,
+            Err(error) => {
+                self.journal.abandon_pending_authorization()?;
+                return Err(error).context(
+                    "transaction signing failed after reserving maximum session exposure; no authorization is refunded",
+                );
+            }
+        };
         if action == TransactionAction::SubmitProof {
             self.record_proof_metric(node_id, ProofMetric::Signed);
         }
-        self.journal.prepare(PreparedTransaction {
+        let prepared = self.journal.prepare(PreparedTransaction {
             request,
             tx_hash: signed.hash,
             intent,
@@ -3580,7 +3606,13 @@ impl TransactionManager {
             minimum_reserve: self.minimum_reserve,
             confirmed_balance: spendable_balance,
             confirmations_required: self.confirmations_required,
-        })?;
+        });
+        if let Err(error) = prepared {
+            self.journal.abandon_pending_authorization()?;
+            return Err(error).context(
+                "transaction journal preparation failed after reserving maximum session exposure; no authorization is refunded",
+            );
+        }
         if action == TransactionAction::SubmitProof {
             self.current_process_proof_hashes.insert(signed.hash);
         }
@@ -3641,10 +3673,6 @@ impl TransactionManager {
             }
         }
         self.publish_dashboard_state();
-
-        if action == TransactionAction::ForwardReward {
-            return Ok(SendOutcome::Broadcast(signed.hash));
-        }
 
         let deadline = Instant::now() + RECEIPT_WAIT;
         // The mining coordinator awaits this send through receipt finality. Keep applying
@@ -3764,11 +3792,11 @@ impl TransactionManager {
                                 self.record_proof_metric(node_id, ProofMetric::CandidateRejected);
                             }
                         }
-                        return Ok(SendOutcome::Confirmed(ConfirmedAction {
+                        return Ok(ConfirmedAction {
                             transaction_hash: signed.hash,
                             receipt,
                             outcome,
-                        }));
+                        });
                     }
                     ReceiptProgress::Pending => {
                         let entry = self.journal.entry(signed.hash)?;
@@ -4014,6 +4042,11 @@ async fn scan_reward_job(
     snapshot: crate::rpc::BlockSnapshot,
     job: RewardScanJob,
 ) -> Result<RewardScanJobOutput> {
+    #[cfg(test)]
+    eprintln!(
+        "test reward scan start key={} range={}..={}",
+        job.key, job.from_block, job.to_block
+    );
     let logs = client
         .window_finalization_logs_range(
             job.candidate.contract,
@@ -4029,6 +4062,8 @@ async fn scan_reward_job(
             job.to_block,
         )
         .await?;
+    #[cfg(test)]
+    eprintln!("test reward scan logs key={} count={}", job.key, logs.len());
     if logs.is_empty() {
         let (retry_after_unix_secs, retry_backoff_secs, rescan_active) =
             if job.to_block < snapshot.number {
@@ -4119,7 +4154,7 @@ async fn validate_forwarding_reward_confirmation(
         .forwarding
         .as_ref()
         .context("reward forwarding intent has no source reward evidence")?;
-    let mut canonical_blocks = HashMap::from([(snapshot.block.number, snapshot.block.hash)]);
+    let mut canonical_blocks = HashMap::new();
     let confirmations = client
         .receipt_confirmations_at_snapshot(
             forwarding.reward_block,
@@ -4573,6 +4608,48 @@ fn validate_journal(state: &JournalState) -> Result<()> {
         }
         parse_decimal_wei(&session.limit_wei)
             .context("journal session spending limit is invalid")?;
+        parse_decimal_wei(
+            session
+                .authorized_exposure_wei
+                .as_deref()
+                .context("journal session has no cumulative authorization counter")?,
+        )
+        .context("journal session authorization counter is invalid")?;
+        parse_decimal_wei(
+            session
+                .reported_actual_wei
+                .as_deref()
+                .context("journal session has no RPC-reported actual-cost counter")?,
+        )
+        .context("journal session RPC-reported actual-cost counter is invalid")?;
+    }
+    if let Some(pending) = &state.pending_authorization {
+        B256::from_str(&pending.request_hash)
+            .context("pending authorization request fingerprint is invalid")?;
+        if parse_decimal_wei(&pending.maximum_exposure_wei)?.is_zero() {
+            bail!("pending transaction authorization has zero maximum exposure");
+        }
+        let session = state
+            .active_session
+            .as_ref()
+            .context("pending transaction authorization has no active session")?;
+        if session.id != pending.session_id
+            || parse_decimal_wei(
+                session
+                    .authorized_exposure_wei
+                    .as_deref()
+                    .context("pending authorization session has no cumulative counter")?,
+            )? < parse_decimal_wei(&pending.maximum_exposure_wei)?
+        {
+            bail!("pending transaction authorization is not covered by its active session counter");
+        }
+        if state
+            .entries
+            .iter()
+            .any(|entry| entry.status.is_unresolved())
+        {
+            bail!("pending transaction authorization overlaps another unresolved transaction");
+        }
     }
     for (contract, window_id) in &state.proof_attempted_through {
         Address::from_str(contract).context("journal proof-attempt contract is invalid")?;
@@ -4655,6 +4732,28 @@ fn validate_journal(state: &JournalState) -> Result<()> {
         }
         if let Some(block_hash) = &entry.receipt_block_hash {
             B256::from_str(block_hash).context("journal receipt block hash is invalid")?;
+        }
+        let settled = matches!(
+            entry.status,
+            TransactionStatus::MinedSuccess | TransactionStatus::MinedReverted
+        );
+        if settled && entry.receipt_verification == ReceiptVerification::Unverified {
+            bail!("settled transaction has no receipt verification classification");
+        }
+        if entry.receipt_verification == ReceiptVerification::LegacyUnverified && !settled {
+            bail!(
+                "legacy-unverified receipt classification is valid only for preserved settlements"
+            );
+        }
+        if entry.receipt_verification == ReceiptVerification::TrustedRpcChecked
+            && !matches!(
+                entry.status,
+                TransactionStatus::Included
+                    | TransactionStatus::MinedSuccess
+                    | TransactionStatus::MinedReverted
+            )
+        {
+            bail!("trusted-RPC-checked receipt has no included or settled transaction status");
         }
         if let Some(reward_block_hash) = &entry.reward_block_hash {
             B256::from_str(reward_block_hash).context("journal reward block hash is invalid")?;
@@ -5079,6 +5178,7 @@ fn validate_archive_ledger(
             version: JOURNAL_VERSION,
             active_session: None,
             entries: archive.entries.clone(),
+            pending_authorization: None,
             proof_attempted_through: state.proof_attempted_through.clone(),
             archives: Vec::new(),
             archived_session_spending: HashMap::new(),
@@ -5140,24 +5240,228 @@ fn validate_archive_ledger(
     Ok(())
 }
 
+fn initialize_session_accounting(store: &ConfigStore, state: &mut JournalState) -> Result<bool> {
+    let Some(session_id) = state
+        .active_session
+        .as_ref()
+        .map(|session| session.id.clone())
+    else {
+        return Ok(false);
+    };
+    let mut authorized = U256::ZERO;
+    let mut reported_actual = U256::ZERO;
+    let mut account_entry = |entry: &TransactionEntry| -> Result<()> {
+        if entry.session_id != session_id {
+            return Ok(());
+        }
+        authorized = authorized
+            .checked_add(parse_decimal_wei(&entry.maximum_exposure_wei)?)
+            .context("session authorization total overflow during journal migration")?;
+        if entry.receipt_verification == ReceiptVerification::TrustedRpcChecked
+            && let Some(actual) = entry.actual_cost_wei.as_deref()
+        {
+            reported_actual = reported_actual
+                .checked_add(parse_decimal_wei(actual)?)
+                .context("RPC-reported actual-cost total overflow during journal migration")?;
+        }
+        Ok(())
+    };
+    for entry in &state.entries {
+        account_entry(entry)?;
+    }
+    for meta in &state.archives {
+        let contents = store.read_transaction_archive(&meta.file_name)?;
+        let archive: JournalArchive =
+            serde_json::from_slice(&contents).context("decode transaction archive")?;
+        for entry in &archive.entries {
+            account_entry(entry)?;
+        }
+    }
+    if let Some(pending) = &state.pending_authorization {
+        if pending.session_id != session_id {
+            bail!("pending authorization belongs to a different active spending session");
+        }
+        authorized = authorized
+            .checked_add(parse_decimal_wei(&pending.maximum_exposure_wei)?)
+            .context("pending session authorization total overflow")?;
+    }
+
+    let session = state
+        .active_session
+        .as_mut()
+        .context("active transaction session disappeared during migration")?;
+    let mut changed = false;
+    let authorized_recorded = session.authorized_exposure_wei.clone();
+    match authorized_recorded.as_deref() {
+        Some(recorded) => {
+            let recorded =
+                parse_decimal_wei(recorded).context("session authorization counter is invalid")?;
+            if recorded < authorized {
+                session.authorized_exposure_wei = Some(authorized.to_string());
+                changed = true;
+            }
+        }
+        None => {
+            session.authorized_exposure_wei = Some(authorized.to_string());
+            changed = true;
+        }
+    }
+    let actual_recorded = session.reported_actual_wei.clone();
+    match actual_recorded.as_deref() {
+        Some(recorded) => {
+            let recorded = parse_decimal_wei(recorded)
+                .context("RPC-reported actual-cost counter is invalid")?;
+            if recorded < reported_actual {
+                session.reported_actual_wei = Some(reported_actual.to_string());
+                changed = true;
+            }
+        }
+        None => {
+            session.reported_actual_wei = Some(reported_actual.to_string());
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
 fn entry_hash(entry: &TransactionEntry) -> Result<B256> {
     B256::from_str(&entry.transaction_hash).context("transaction journal hash is invalid")
 }
 
-fn parse_decimal_wei(value: &str) -> Result<U256> {
-    U256::from_str_radix(value, 10).context("transaction journal amount is not decimal wei")
+fn maximum_transaction_exposure(request: &Eip1559Request) -> Result<U256> {
+    let gas_exposure = U256::from(request.gas_limit)
+        .checked_mul(request.max_fee_per_gas)
+        .context("maximum gas exposure overflow")?;
+    request
+        .value
+        .checked_add(gas_exposure)
+        .context("maximum transaction exposure overflow")
 }
 
-fn format_ast_wei(value: U256) -> String {
-    let scale = U256::from(1_000_000_000_u64);
-    let whole = value / scale;
-    let fractional = (value % scale).to_string();
-    let fractional = format!("{fractional:0>9}").trim_end_matches('0').to_owned();
-    if fractional.is_empty() {
-        whole.to_string()
-    } else {
-        format!("{whole}.{fractional}")
+fn transaction_request_hash(request: &Eip1559Request) -> B256 {
+    let mut encoded = Vec::with_capacity(8 + 8 + 32 * 3 + 8 + request.data.len());
+    encoded.extend_from_slice(&request.chain_id.to_be_bytes());
+    encoded.extend_from_slice(&request.nonce.to_be_bytes());
+    encoded.extend_from_slice(&request.max_priority_fee_per_gas.to_be_bytes::<32>());
+    encoded.extend_from_slice(&request.max_fee_per_gas.to_be_bytes::<32>());
+    encoded.extend_from_slice(&request.gas_limit.to_be_bytes());
+    encoded.extend_from_slice(request.to.as_slice());
+    encoded.extend_from_slice(&request.value.to_be_bytes::<32>());
+    encoded.extend_from_slice(&(request.data.len() as u64).to_be_bytes());
+    encoded.extend_from_slice(&request.data);
+    keccak256(encoded)
+}
+
+fn validate_transaction_binding(
+    entry: &TransactionEntry,
+    transaction: &TransactionDetails,
+    receipt: &TransactionReceipt,
+) -> Result<()> {
+    let hash = entry_hash(entry)?;
+    let wallet = Address::from_str(&entry.wallet).context("journal wallet address is invalid")?;
+    let contract =
+        Address::from_str(&entry.contract).context("journal contract address is invalid")?;
+    let value = parse_decimal_wei(&entry.value_wei)?;
+    let maximum_fee = parse_decimal_wei(&entry.max_fee_per_gas_wei)?;
+
+    if transaction.hash != hash
+        || transaction.chain_id != Some(entry.chain_id)
+        || transaction.from != wallet
+        || transaction.to != Some(contract)
+        || transaction.nonce != entry.nonce
+        || transaction.value != value
+        || transaction.gas_limit != entry.gas_limit
+    {
+        bail!(
+            "chain transaction sender, chain, destination, nonce, value, or gas limit differs from the signed journal intent"
+        );
     }
+
+    let expected_input = match entry.action {
+        TransactionAction::SubmitProof => {
+            let nonce = entry
+                .proof_nonce
+                .context("proof nonce is missing from submission journal")?;
+            let header = hex::decode(
+                entry
+                    .header_hex
+                    .as_deref()
+                    .context("proof header is missing from submission journal")?,
+            )
+            .context("journal proof header is invalid hex")?;
+            AstatineMinerRead::submitSolutionCall {
+                header: Bytes::from(header),
+                nonce,
+            }
+            .abi_encode()
+        }
+        TransactionAction::FinalizeWindow => AstatineMinerRead::finalizeWindowCall {}.abi_encode(),
+        TransactionAction::ForwardReward => {
+            let destination = Address::from_str(
+                entry
+                    .reward_forward_destination
+                    .as_deref()
+                    .context("reward transfer destination is missing from journal")?,
+            )
+            .context("journal reward transfer destination is invalid")?;
+            let amount = parse_decimal_wei(
+                entry
+                    .forward_amount_wei
+                    .as_deref()
+                    .context("reward transfer amount is missing from journal")?,
+            )?;
+            IERC20Read::transferCall {
+                to: destination,
+                amount,
+            }
+            .abi_encode()
+        }
+    };
+    if transaction.input.as_ref() != expected_input {
+        bail!("chain transaction calldata differs from the signed journal intent");
+    }
+
+    match transaction
+        .transaction_type
+        .context("chain transaction has no type")?
+    {
+        0 => {
+            let gas_price = transaction
+                .gas_price
+                .context("legacy chain transaction has no gas price")?;
+            if gas_price.is_zero() || gas_price > maximum_fee {
+                bail!("legacy chain transaction gas price exceeds the journaled maximum fee");
+            }
+        }
+        2 => {
+            if transaction.max_fee_per_gas != Some(maximum_fee) {
+                bail!("chain transaction maximum fee differs from the journaled signed fee cap");
+            }
+            let priority_fee = transaction
+                .max_priority_fee_per_gas
+                .context("EIP-1559 chain transaction has no priority fee")?;
+            if priority_fee > maximum_fee {
+                bail!("chain transaction priority fee exceeds its maximum fee");
+            }
+        }
+        transaction_type => bail!("unsupported chain transaction type {transaction_type}"),
+    }
+
+    if receipt.transaction_hash != hash
+        || receipt.from != wallet
+        || receipt.to != Some(contract)
+        || receipt.transaction_type != transaction.transaction_type
+        || receipt.gas_used > U256::from(entry.gas_limit)
+    {
+        bail!(
+            "selected RPC receipt sender, destination, type, or gas usage differs from the signed transaction"
+        );
+    }
+    Ok(())
+}
+
+fn parse_decimal_wei(value: &str) -> Result<U256> {
+    U256::from_str_radix(value, 10).context("transaction journal amount is not decimal wei")
 }
 
 fn new_session_id() -> String {
@@ -5176,15 +5480,16 @@ fn unix_time_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        ARCHIVE_AFTER_CONFIRMATIONS, ARCHIVE_TRIGGER_ENTRIES, Eip1559Request, HistoryCounter,
-        HistoryTelemetry, JOURNAL_VERSION, PreparedTransaction, ProofData, ProofSubmission,
-        REWARD_EMPTY_SCAN_RETRY_BASE_SECS, RewardForwardingStatus, RewardScanAnchor,
-        RewardScanBatchOutput, RewardScanCursor, SUBMISSION_FEE_WEI, TransactionAction,
-        TransactionActivity, TransactionActivityState, TransactionDashboardState, TransactionEntry,
-        TransactionIntent, TransactionJournal, TransactionManager, TransactionPolicyRefusalKind,
-        TransactionStatus, encode_rlp_list, entry_hash, parse_decimal_wei, reward_scan_key,
-        rlp_bytes, rlp_u64, rlp_u256, run_reward_scan_batch, sign_eip1559,
-        transaction_policy_refusal, unix_time_secs, validate_archive_ledger,
+        ARCHIVE_AFTER_CONFIRMATIONS, ARCHIVE_TRIGGER_ENTRIES, AUTOMATIC_REWARD_FORWARDING_DISABLED,
+        Eip1559Request, ForwardingIntent, HistoryCounter, HistoryTelemetry, JOURNAL_VERSION,
+        PreparedTransaction, ProofData, ProofSubmission, REWARD_EMPTY_SCAN_RETRY_BASE_SECS,
+        RewardForwardingStatus, RewardScanAnchor, RewardScanBatchOutput, RewardScanCursor,
+        SUBMISSION_FEE_WEI, TransactionAction, TransactionActivity, TransactionActivityState,
+        TransactionDashboardState, TransactionEntry, TransactionIntent, TransactionJournal,
+        TransactionManager, TransactionPolicyRefusalKind, TransactionStatus, encode_rlp_list,
+        entry_hash, maximum_transaction_exposure, parse_decimal_wei, reward_scan_key, rlp_bytes,
+        rlp_u64, rlp_u256, run_reward_scan_batch, sign_eip1559, transaction_policy_refusal,
+        unix_time_secs, validate_archive_ledger, validate_transaction_binding,
         verify_finalization_events, verify_submission_events,
     };
     use crate::{
@@ -5199,7 +5504,7 @@ mod tests {
         },
         proof_telemetry::{ProofMetric, ProofPipelineTelemetry},
         protocol::{WorkContext, WorkHasher, beats_incumbent, meets_target},
-        rpc::{NetworkClient, RpcLog, TransactionReceipt},
+        rpc::{NetworkClient, RpcLog, TransactionDetails, TransactionReceipt},
         wallet::signer_address,
     };
     use alloy_primitives::{Address, B256, Bytes, U256, hex, keccak256};
@@ -5314,6 +5619,7 @@ mod tests {
             gas_limit: 21_000,
             maximum_exposure_wei: "1000".to_owned(),
             status: TransactionStatus::MinedSuccess,
+            receipt_verification: super::ReceiptVerification::LegacyUnverified,
             actual_cost_wei: Some("100".to_owned()),
             last_known_cost_wei: None,
             outcome: Some(outcome.to_owned()),
@@ -5344,54 +5650,286 @@ mod tests {
     }
 
     #[test]
-    fn restart_cannot_change_destination_for_any_pending_reward_forwarding_state() {
-        let temp = tempdir().unwrap();
-        let store = ConfigStore::at_root(temp.path().to_path_buf());
-        let config = AppConfig::default();
+    fn receipt_settlement_requires_chain_transaction_to_match_journaled_intent() {
         let wallet = Address::with_last_byte(0x31);
-        let original_destination = Address::with_last_byte(0x32);
-        let changed_destination = Address::with_last_byte(0x33);
         let contract = Address::with_last_byte(0x41);
-        let mut journal = TransactionJournal::open(&store, &config, wallet).unwrap();
-        let pending_states = [
-            RewardForwardingStatus::AwaitingReward,
-            RewardForwardingStatus::VerifiedEligible,
-            RewardForwardingStatus::Signed,
-            RewardForwardingStatus::Broadcast,
-            RewardForwardingStatus::ReceiptPending,
-            RewardForwardingStatus::UnknownOutcome,
-            RewardForwardingStatus::PolicyBlocked,
-            RewardForwardingStatus::Reverted,
-        ];
-        for (index, status) in pending_states.into_iter().enumerate() {
-            let mut source = settled_history_entry(
-                contract,
-                1,
-                wallet,
-                "pending-forward-resume",
-                index as u64,
-                B256::with_last_byte(index as u8 + 1),
-                TransactionAction::SubmitProof,
-                "candidate-updated",
-                Some("reward-paid:100".to_owned()),
-                2,
-            );
-            source.reward_forward_destination = Some(format!("{original_destination:#x}"));
-            source.reward_forward_status = Some(status);
-            journal.state.entries.clear();
-            journal.state.entries.push(source);
-
-            assert!(
-                journal
-                    .validate_reward_forward_resume_destination(original_destination)
-                    .is_ok()
-            );
-            assert!(
-                journal
-                    .validate_reward_forward_resume_destination(changed_destination)
-                    .is_err()
-            );
+        let hash = B256::with_last_byte(0x51);
+        let mut entry = settled_history_entry(
+            contract,
+            1,
+            wallet,
+            "receipt-binding",
+            4,
+            hash,
+            TransactionAction::SubmitProof,
+            "candidate-updated",
+            None,
+            0,
+        );
+        entry.nonce = 3;
+        entry.value_wei = SUBMISSION_FEE_WEI.to_string();
+        entry.max_fee_per_gas_wei = "30".to_owned();
+        entry.gas_limit = 75_000;
+        entry.proof_nonce = Some(42);
+        entry.header_hex = Some("010203".to_owned());
+        let input = AstatineMinerRead::submitSolutionCall {
+            header: Bytes::from(vec![1, 2, 3]),
+            nonce: 42,
         }
+        .abi_encode();
+        let transaction = TransactionDetails {
+            hash,
+            chain_id: Some(1439),
+            from: wallet,
+            to: Some(contract),
+            nonce: 3,
+            value: U256::from(SUBMISSION_FEE_WEI),
+            gas_limit: 75_000,
+            input: Bytes::from(input),
+            gas_price: None,
+            max_fee_per_gas: Some(U256::from(30)),
+            max_priority_fee_per_gas: Some(U256::from(2)),
+            transaction_type: Some(2),
+        };
+        let receipt = TransactionReceipt {
+            transaction_hash: hash,
+            transaction_index: 0,
+            from: wallet,
+            to: Some(contract),
+            status: true,
+            gas_used: U256::from(50_000),
+            cumulative_gas_used: U256::from(50_000),
+            effective_gas_price: Some(U256::from(2)),
+            transaction_type: Some(2),
+            block_number: 10,
+            block_hash: B256::with_last_byte(0x61),
+            logs: Vec::<RpcLog>::new(),
+        };
+
+        assert!(validate_transaction_binding(&entry, &transaction, &receipt).is_ok());
+
+        let mut altered = transaction.clone();
+        altered.from = Address::with_last_byte(0x32);
+        assert!(validate_transaction_binding(&entry, &altered, &receipt).is_err());
+
+        let mut altered = transaction.clone();
+        altered.input = Bytes::from_static(b"forged calldata");
+        assert!(validate_transaction_binding(&entry, &altered, &receipt).is_err());
+
+        let mut altered = transaction.clone();
+        altered.chain_id = Some(1);
+        assert!(validate_transaction_binding(&entry, &altered, &receipt).is_err());
+
+        let mut altered = transaction.clone();
+        altered.to = Some(Address::with_last_byte(0x42));
+        assert!(validate_transaction_binding(&entry, &altered, &receipt).is_err());
+
+        let mut altered = transaction.clone();
+        altered.nonce += 1;
+        assert!(validate_transaction_binding(&entry, &altered, &receipt).is_err());
+
+        let mut altered = transaction.clone();
+        altered.value += U256::from(1);
+        assert!(validate_transaction_binding(&entry, &altered, &receipt).is_err());
+
+        let mut altered = transaction.clone();
+        altered.gas_limit += 1;
+        assert!(validate_transaction_binding(&entry, &altered, &receipt).is_err());
+
+        let mut altered = transaction.clone();
+        altered.max_fee_per_gas = Some(U256::from(31));
+        assert!(validate_transaction_binding(&entry, &altered, &receipt).is_err());
+
+        let mut altered = transaction.clone();
+        altered.max_priority_fee_per_gas = Some(U256::from(31));
+        assert!(validate_transaction_binding(&entry, &altered, &receipt).is_err());
+
+        let mut altered = transaction.clone();
+        altered.transaction_type = Some(1);
+        assert!(validate_transaction_binding(&entry, &altered, &receipt).is_err());
+
+        let mut altered_receipt = receipt.clone();
+        altered_receipt.gas_used = U256::from(75_001);
+        assert!(validate_transaction_binding(&entry, &transaction, &altered_receipt).is_err());
+
+        let mut altered_receipt = receipt.clone();
+        altered_receipt.from = Address::with_last_byte(0x32);
+        assert!(validate_transaction_binding(&entry, &transaction, &altered_receipt).is_err());
+
+        let mut altered_receipt = receipt.clone();
+        altered_receipt.to = Some(Address::with_last_byte(0x42));
+        assert!(validate_transaction_binding(&entry, &transaction, &altered_receipt).is_err());
+
+        let mut altered_receipt = receipt.clone();
+        altered_receipt.transaction_type = Some(0);
+        assert!(validate_transaction_binding(&entry, &transaction, &altered_receipt).is_err());
+
+        let mut finalize_entry = entry.clone();
+        finalize_entry.action = TransactionAction::FinalizeWindow;
+        finalize_entry.value_wei = "0".to_owned();
+        finalize_entry.proof_nonce = None;
+        finalize_entry.header_hex = None;
+        let mut finalize_transaction = transaction.clone();
+        finalize_transaction.value = U256::ZERO;
+        finalize_transaction.input =
+            Bytes::from(AstatineMinerRead::finalizeWindowCall {}.abi_encode());
+        assert!(
+            validate_transaction_binding(&finalize_entry, &finalize_transaction, &receipt).is_ok()
+        );
+
+        let token = Address::with_last_byte(0x77);
+        let destination = Address::with_last_byte(0x78);
+        let amount = U256::from(123);
+        let mut forward_entry = entry;
+        forward_entry.action = TransactionAction::ForwardReward;
+        forward_entry.contract = format!("{token:#x}");
+        forward_entry.value_wei = "0".to_owned();
+        forward_entry.proof_nonce = None;
+        forward_entry.header_hex = None;
+        forward_entry.reward_forward_destination = Some(format!("{destination:#x}"));
+        forward_entry.forward_amount_wei = Some(amount.to_string());
+        let mut forward_transaction = transaction;
+        forward_transaction.to = Some(token);
+        forward_transaction.value = U256::ZERO;
+        forward_transaction.input = Bytes::from(
+            IERC20Read::transferCall {
+                to: destination,
+                amount,
+            }
+            .abi_encode(),
+        );
+        let mut forward_receipt = receipt;
+        forward_receipt.to = Some(token);
+        assert!(
+            validate_transaction_binding(&forward_entry, &forward_transaction, &forward_receipt)
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn forged_rpc_transaction_details_keep_session_authorization_charged() {
+        let root = tempdir().unwrap();
+        let store = ConfigStore::at_root(PathBuf::from(root.path()));
+        let config = AppConfig {
+            minimum_reserve_inj: "0".to_owned(),
+            per_session_spending_limit_inj: "1".to_owned(),
+            ..AppConfig::default()
+        };
+        let wallet = Address::with_last_byte(0x31);
+        let mut request = test_request();
+        let proof = ProofData {
+            nonce: 42,
+            work_hash: B256::with_last_byte(0x42),
+            header: vec![1, 2, 3],
+        };
+        request.data = AstatineMinerRead::submitSolutionCall {
+            header: Bytes::from(proof.header.clone()),
+            nonce: proof.nonce,
+        }
+        .abi_encode();
+        let tx_hash = sign_eip1559(&test_signer(), &request).unwrap().hash;
+        let token = Address::with_last_byte(0x51);
+        let mut manager = TransactionManager::open(&store, &config, wallet, token).unwrap();
+        manager
+            .journal
+            .prepare(prepared_test_transaction(
+                &request,
+                tx_hash,
+                U256::from(1_000_000_000_000_000_000_u128),
+                U256::ZERO,
+                U256::MAX,
+                Some(proof),
+            ))
+            .unwrap();
+        manager
+            .journal
+            .set_broadcast_state(tx_hash, TransactionStatus::Broadcast)
+            .unwrap();
+        let authorized_before = manager.journal.session_authorized_total().unwrap();
+        let entry = manager.journal.entry(tx_hash).unwrap().clone();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let forged_sender = Address::with_last_byte(0x32);
+        let transaction_request = request.clone();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request_json = read_history_http_request(&mut stream);
+            assert_eq!(request_json["method"], "eth_getTransactionByHash");
+            let result = serde_json::json!({
+                "hash": format!("{tx_hash:#x}"),
+                "chainId": format!("0x{:x}", transaction_request.chain_id),
+                "from": format!("{forged_sender:#x}"),
+                "to": format!("{:#x}", transaction_request.to),
+                "nonce": format!("0x{:x}", transaction_request.nonce),
+                "value": format!("{:#x}", transaction_request.value),
+                "gas": format!("0x{:x}", transaction_request.gas_limit),
+                "input": format!("0x{}", hex::encode(&transaction_request.data)),
+                "maxFeePerGas": format!("{:#x}", transaction_request.max_fee_per_gas),
+                "maxPriorityFeePerGas": format!(
+                    "{:#x}",
+                    transaction_request.max_priority_fee_per_gas
+                ),
+                "type": "0x2",
+            });
+            let response = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": request_json["id"],
+                "result": result,
+            })
+            .to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                response.len()
+            )
+            .unwrap();
+        });
+        let url = format!("http://{address}");
+        let client = NetworkClient::local_test_client(
+            &url,
+            request.to,
+            B256::with_last_byte(0x61),
+            token,
+            B256::with_last_byte(0x62),
+            9,
+        )
+        .unwrap();
+        let receipt = TransactionReceipt {
+            transaction_hash: tx_hash,
+            transaction_index: 0,
+            from: wallet,
+            to: Some(request.to),
+            status: true,
+            gas_used: U256::from(50_000),
+            cumulative_gas_used: U256::from(50_000),
+            effective_gas_price: Some(U256::from(2)),
+            transaction_type: Some(2),
+            block_number: 10,
+            block_hash: B256::with_last_byte(0x63),
+            logs: Vec::new(),
+        };
+
+        assert!(matches!(
+            manager
+                .process_receipt(&client, &entry, &receipt, 11)
+                .await
+                .unwrap(),
+            super::ReceiptProgress::Uncertain
+        ));
+        server.join().unwrap();
+        assert_eq!(
+            manager.journal.session_authorized_total().unwrap(),
+            authorized_before
+        );
+        assert_eq!(
+            manager.journal.session_reported_actual_spending().unwrap(),
+            Some(U256::ZERO)
+        );
+        assert_eq!(
+            manager.journal.entry(tx_hash).unwrap().status,
+            TransactionStatus::Unknown
+        );
     }
 
     fn prepared_test_transaction(
@@ -5664,7 +6202,7 @@ mod tests {
         );
         assert_eq!(
             rpc_counts.lock().unwrap().get("eth_getBlockByNumber"),
-            Some(&1)
+            Some(&2)
         );
     }
 
@@ -5783,6 +6321,10 @@ mod tests {
             .unwrap()
             .remove("reward_scan_cursors");
         legacy.as_object_mut().unwrap().remove("reward_scan_anchor");
+        legacy["entries"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("receipt_verification");
         drop(journal);
         store
             .write_transaction_journal(&serde_json::to_vec(&legacy).unwrap())
@@ -5795,6 +6337,10 @@ mod tests {
         assert_eq!(migrated.state.entries.len(), 1);
         assert_eq!(entry_hash(&migrated.state.entries[0]).unwrap(), hash);
         assert_eq!(
+            migrated.state.entries[0].receipt_verification,
+            super::ReceiptVerification::LegacyUnverified
+        );
+        assert_eq!(
             migrated.state.entries[0].reward_outcome.as_deref(),
             Some("reward-paid:123000000000")
         );
@@ -5804,6 +6350,517 @@ mod tests {
                 .proof_attempted_through
                 .get(&format!("{contract:#x}")),
             Some(&42)
+        );
+    }
+
+    #[test]
+    fn testnet12_v5_settlement_migration_preserves_cost_without_claiming_rc1_verification() {
+        let root = tempdir().unwrap();
+        let store = ConfigStore::at_root(PathBuf::from(root.path()));
+        let config = AppConfig {
+            per_session_spending_limit_inj: "1".to_owned(),
+            ..AppConfig::default()
+        };
+        let wallet = Address::with_last_byte(0x77);
+        let contract = Address::with_last_byte(1);
+        let mut journal = TransactionJournal::open(&store, &config, wallet).unwrap();
+        let session_id = journal.state.active_session.as_ref().unwrap().id.clone();
+        journal.state.entries.push(settled_history_entry(
+            contract,
+            1,
+            wallet,
+            &session_id,
+            42,
+            B256::with_last_byte(0x52),
+            TransactionAction::FinalizeWindow,
+            "window-finalized",
+            None,
+            0,
+        ));
+        let mut included = settled_history_entry(
+            contract,
+            1,
+            wallet,
+            &session_id,
+            43,
+            B256::with_last_byte(0x53),
+            TransactionAction::FinalizeWindow,
+            "window-finalized",
+            None,
+            0,
+        );
+        included.status = TransactionStatus::Included;
+        included.actual_cost_wei = None;
+        included.last_known_cost_wei = Some("75".to_owned());
+        included.confirmations = 1;
+        journal.state.entries.push(included);
+        journal.state.version = 5;
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&serde_json::to_vec(&journal.state).unwrap()).unwrap();
+        for entry in legacy["entries"].as_array_mut().unwrap() {
+            entry
+                .as_object_mut()
+                .unwrap()
+                .remove("receipt_verification");
+        }
+        drop(journal);
+        store
+            .write_transaction_journal(&serde_json::to_vec(&legacy).unwrap())
+            .unwrap();
+
+        let mut migrated = TransactionJournal::open(&store, &config, wallet).unwrap();
+        let entry = &migrated.state.entries[0];
+        let hash = entry_hash(entry).unwrap();
+        assert_eq!(migrated.state.version, super::JOURNAL_VERSION);
+        assert_eq!(entry.status, TransactionStatus::MinedSuccess);
+        assert_eq!(
+            entry.receipt_verification,
+            super::ReceiptVerification::LegacyUnverified
+        );
+        assert_eq!(entry.actual_cost_wei.as_deref(), Some("100"));
+        assert_eq!(
+            migrated.session_authorized_total().unwrap(),
+            U256::from(2_000)
+        );
+        assert!(migrated.has_unresolved());
+        assert_eq!(migrated.pending_exposure().unwrap(), U256::from(1_000));
+        assert_eq!(
+            migrated.state.entries[1].status,
+            TransactionStatus::Included
+        );
+        assert_eq!(
+            migrated.state.entries[1].receipt_verification,
+            super::ReceiptVerification::Unverified
+        );
+        let receipt = TransactionReceipt {
+            transaction_hash: hash,
+            transaction_index: 0,
+            from: wallet,
+            to: Some(contract),
+            status: true,
+            gas_used: U256::from(100),
+            cumulative_gas_used: U256::from(100),
+            effective_gas_price: Some(U256::from(1)),
+            transaction_type: Some(2),
+            block_number: 10,
+            block_hash: B256::with_last_byte(0x10),
+            logs: Vec::new(),
+        };
+        assert!(
+            migrated
+                .settle_receipt(
+                    hash,
+                    &receipt,
+                    ARCHIVE_AFTER_CONFIRMATIONS,
+                    U256::from(100),
+                    "window-finalized".to_owned(),
+                )
+                .is_err(),
+            "legacy status alone must not be promoted to trusted-RPC-checked settlement"
+        );
+    }
+
+    #[test]
+    fn trusted_success_and_revert_receipts_never_refund_session_authorization() {
+        let root = tempdir().unwrap();
+        let store = ConfigStore::at_root(PathBuf::from(root.path()));
+        let config = AppConfig {
+            per_session_spending_limit_inj: "1".to_owned(),
+            ..AppConfig::default()
+        };
+        let wallet = Address::with_last_byte(0x99);
+        let mut journal = TransactionJournal::open(&store, &config, wallet).unwrap();
+        let proof_request = test_request();
+        let proof_hash = sign_eip1559(&test_signer(), &proof_request).unwrap().hash;
+        let proof_maximum = maximum_transaction_exposure(&proof_request).unwrap();
+        journal
+            .prepare(prepared_test_transaction(
+                &proof_request,
+                proof_hash,
+                U256::from(1_000_000_000_000_000_000_u128),
+                U256::ZERO,
+                U256::MAX,
+                Some(ProofData {
+                    nonce: 8,
+                    work_hash: B256::with_last_byte(7),
+                    header: b"authorization-test".to_vec(),
+                }),
+            ))
+            .unwrap();
+        let proof_receipt = TransactionReceipt {
+            transaction_hash: proof_hash,
+            transaction_index: 0,
+            from: wallet,
+            to: Some(proof_request.to),
+            status: true,
+            gas_used: U256::from(30_000),
+            cumulative_gas_used: U256::from(30_000),
+            effective_gas_price: Some(U256::from(1)),
+            transaction_type: Some(2),
+            block_number: 10,
+            block_hash: B256::with_last_byte(0x10),
+            logs: Vec::new(),
+        };
+        journal
+            .record_included(
+                proof_hash,
+                &proof_receipt,
+                2,
+                "candidate-updated".to_owned(),
+            )
+            .unwrap();
+        journal
+            .settle_receipt(
+                proof_hash,
+                &proof_receipt,
+                2,
+                U256::from(1),
+                "candidate-updated".to_owned(),
+            )
+            .unwrap();
+        assert_eq!(journal.session_authorized_total().unwrap(), proof_maximum);
+
+        let finalize_request = Eip1559Request {
+            chain_id: 1439,
+            nonce: 4,
+            max_priority_fee_per_gas: U256::from(2_000_000_000_u64),
+            max_fee_per_gas: U256::from(30_000_000_000_u64),
+            gas_limit: 75_000,
+            to: proof_request.to,
+            value: U256::ZERO,
+            data: AstatineMinerRead::finalizeWindowCall {}.abi_encode(),
+        };
+        let finalize_hash = sign_eip1559(&test_signer(), &finalize_request)
+            .unwrap()
+            .hash;
+        let finalize_maximum = maximum_transaction_exposure(&finalize_request).unwrap();
+        journal
+            .prepare(PreparedTransaction {
+                request: finalize_request.clone(),
+                tx_hash: finalize_hash,
+                intent: TransactionIntent {
+                    contract: finalize_request.to,
+                    node_id: 1,
+                    window_id: 5,
+                    action: TransactionAction::FinalizeWindow,
+                    proof: None,
+                    reward_destination: None,
+                    forwarding: None,
+                },
+                session_limit: U256::from(1_000_000_000_000_000_000_u128),
+                minimum_reserve: U256::ZERO,
+                confirmed_balance: U256::MAX,
+                confirmations_required: 2,
+            })
+            .unwrap();
+        let reverted_receipt = TransactionReceipt {
+            transaction_hash: finalize_hash,
+            transaction_index: 0,
+            from: wallet,
+            to: Some(finalize_request.to),
+            status: false,
+            gas_used: U256::from(20_000),
+            cumulative_gas_used: U256::from(20_000),
+            effective_gas_price: Some(U256::from(1)),
+            transaction_type: Some(2),
+            block_number: 11,
+            block_hash: B256::with_last_byte(0x11),
+            logs: Vec::new(),
+        };
+        journal
+            .record_included(
+                finalize_hash,
+                &reverted_receipt,
+                2,
+                "transaction-reverted".to_owned(),
+            )
+            .unwrap();
+        journal
+            .settle_receipt(
+                finalize_hash,
+                &reverted_receipt,
+                2,
+                U256::from(2),
+                "transaction-reverted".to_owned(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            journal.session_authorized_total().unwrap(),
+            proof_maximum + finalize_maximum
+        );
+        assert_eq!(
+            journal
+                .state
+                .active_session
+                .as_ref()
+                .unwrap()
+                .reported_actual_wei
+                .as_deref(),
+            Some("3")
+        );
+        drop(journal);
+
+        let reopened = TransactionJournal::open(&store, &config, wallet).unwrap();
+        assert_eq!(
+            reopened.session_authorized_total().unwrap(),
+            proof_maximum + finalize_maximum,
+            "settled success/revert receipts never replenish maximum authorization"
+        );
+    }
+
+    #[test]
+    fn pre_sign_authorization_is_persisted_and_not_refunded_after_restart() {
+        let root = tempdir().unwrap();
+        let store = ConfigStore::at_root(PathBuf::from(root.path()));
+        let config = AppConfig {
+            per_session_spending_limit_inj: "1".to_owned(),
+            ..AppConfig::default()
+        };
+        let wallet = Address::with_last_byte(0x99);
+        let mut journal = TransactionJournal::open(&store, &config, wallet).unwrap();
+        let session_id = journal.state.active_session.as_ref().unwrap().id.clone();
+        let request = test_request();
+        let intent = TransactionIntent {
+            contract: request.to,
+            node_id: 1,
+            window_id: 4,
+            action: TransactionAction::SubmitProof,
+            proof: Some(ProofData {
+                nonce: 8,
+                work_hash: B256::with_last_byte(7),
+                header: b"pre-sign-authorization".to_vec(),
+            }),
+            reward_destination: None,
+            forwarding: None,
+        };
+        let maximum = journal
+            .authorize_exposure(
+                &request,
+                &intent,
+                U256::from(1_000_000_000_000_000_000_u128),
+                U256::ZERO,
+                U256::MAX,
+            )
+            .unwrap();
+        assert!(journal.state.entries.is_empty());
+        assert!(journal.state.pending_authorization.is_some());
+        assert_eq!(journal.session_authorized_total().unwrap(), maximum);
+        let persisted = store.read_transaction_journal().unwrap().unwrap();
+        let persisted: super::JournalState = serde_json::from_slice(&persisted).unwrap();
+        let expected_maximum = maximum.to_string();
+        assert_eq!(
+            persisted
+                .active_session
+                .as_ref()
+                .unwrap()
+                .authorized_exposure_wei
+                .as_deref(),
+            Some(expected_maximum.as_str())
+        );
+        drop(journal);
+
+        let recovered = TransactionJournal::open(&store, &config, wallet).unwrap();
+        assert_eq!(
+            recovered.state.active_session.as_ref().unwrap().id,
+            session_id
+        );
+        assert!(recovered.state.pending_authorization.is_none());
+        assert!(recovered.state.entries.is_empty());
+        assert_eq!(recovered.session_authorized_total().unwrap(), maximum);
+    }
+
+    #[test]
+    fn valid_counter_rewrite_cannot_lower_authorization_while_journaled_entries_remain() {
+        let root = tempdir().unwrap();
+        let store = ConfigStore::at_root(PathBuf::from(root.path()));
+        let config = AppConfig {
+            per_session_spending_limit_inj: "1".to_owned(),
+            ..AppConfig::default()
+        };
+        let wallet = Address::with_last_byte(0x98);
+        let mut journal = TransactionJournal::open(&store, &config, wallet).unwrap();
+        let request = test_request();
+        let tx_hash = sign_eip1559(&test_signer(), &request).unwrap().hash;
+        let maximum = maximum_transaction_exposure(&request).unwrap();
+        journal
+            .prepare(prepared_test_transaction(
+                &request,
+                tx_hash,
+                U256::from(1_000_000_000_000_000_000_u128),
+                U256::ZERO,
+                U256::MAX,
+                Some(ProofData {
+                    nonce: 9,
+                    work_hash: B256::with_last_byte(9),
+                    header: b"journal-counter-rewrite".to_vec(),
+                }),
+            ))
+            .unwrap();
+        drop(journal);
+
+        // The JSON remains syntactically valid; the retained signed-intent entry
+        // is the surviving source used to repair this underreported counter.
+        let mut rewritten: serde_json::Value =
+            serde_json::from_slice(&store.read_transaction_journal().unwrap().unwrap()).unwrap();
+        rewritten["active_session"]["authorized_exposure_wei"] = serde_json::json!("0");
+        store
+            .write_transaction_journal(&serde_json::to_vec(&rewritten).unwrap())
+            .unwrap();
+
+        let reopened = TransactionJournal::open(&store, &config, wallet).unwrap();
+        assert_eq!(reopened.session_authorized_total().unwrap(), maximum);
+        assert_eq!(
+            reopened
+                .state
+                .active_session
+                .as_ref()
+                .unwrap()
+                .authorized_exposure_wei
+                .as_deref(),
+            Some(maximum.to_string().as_str()),
+            "retained transaction entries must repair a validly rewritten-low counter"
+        );
+    }
+
+    #[test]
+    fn crash_after_pre_sign_authorization_keeps_the_budget_charged() {
+        let root = tempdir().unwrap();
+        let store = ConfigStore::at_root(PathBuf::from(root.path()));
+        let config = AppConfig {
+            per_session_spending_limit_inj: "1".to_owned(),
+            ..AppConfig::default()
+        };
+        let wallet = Address::with_last_byte(0x99);
+        let mut journal = TransactionJournal::open(&store, &config, wallet).unwrap();
+        let session_id = journal.state.active_session.as_ref().unwrap().id.clone();
+        let request = test_request();
+        let intent = TransactionIntent {
+            contract: request.to,
+            node_id: 1,
+            window_id: 4,
+            action: TransactionAction::SubmitProof,
+            proof: Some(ProofData {
+                nonce: 8,
+                work_hash: B256::with_last_byte(7),
+                header: b"pre-sign-authorization".to_vec(),
+            }),
+            reward_destination: None,
+            forwarding: None,
+        };
+        let maximum = journal
+            .authorize_exposure(
+                &request,
+                &intent,
+                U256::from(1_000_000_000_000_000_000_u128),
+                U256::ZERO,
+                U256::MAX,
+            )
+            .unwrap();
+        assert!(journal.state.entries.is_empty());
+        assert!(journal.state.pending_authorization.is_some());
+        assert_eq!(journal.session_authorized_total().unwrap(), maximum);
+        drop(journal);
+
+        let recovered = TransactionJournal::open(&store, &config, wallet).unwrap();
+        assert_eq!(
+            recovered.state.active_session.as_ref().unwrap().id,
+            session_id
+        );
+        assert!(recovered.state.pending_authorization.is_none());
+        assert!(recovered.state.entries.is_empty());
+        assert_eq!(recovered.session_authorized_total().unwrap(), maximum);
+    }
+
+    #[test]
+    fn prior_spending_session_is_not_reset_at_startup_without_explicit_authorization() {
+        let root = tempdir().unwrap();
+        let store = ConfigStore::at_root(PathBuf::from(root.path()));
+        let config = AppConfig {
+            per_session_spending_limit_inj: "1".to_owned(),
+            ..AppConfig::default()
+        };
+        let wallet = Address::with_last_byte(0x77);
+        let contract = Address::with_last_byte(1);
+        let mut journal = TransactionJournal::open(&store, &config, wallet).unwrap();
+        let old_session = journal.state.active_session.as_ref().unwrap().id.clone();
+        let entry = settled_history_entry(
+            contract,
+            1,
+            wallet,
+            &old_session,
+            42,
+            B256::with_last_byte(0x52),
+            TransactionAction::FinalizeWindow,
+            "window-finalized",
+            None,
+            0,
+        );
+        journal.state.entries.push(entry);
+        journal
+            .state
+            .active_session
+            .as_mut()
+            .unwrap()
+            .authorized_exposure_wei = Some("1000".to_owned());
+        journal.close_session().unwrap();
+        drop(journal);
+
+        let telemetry = Arc::new(HistoryTelemetry::default());
+        let error = match TransactionJournal::open_with_session_policy(
+            &store,
+            &config,
+            wallet,
+            Arc::clone(&telemetry),
+            false,
+            false,
+        ) {
+            Ok(_) => {
+                panic!("a used closed session must require explicit new-session authorization")
+            }
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("--new-session"));
+
+        let new_session = TransactionJournal::open_with_session_policy(
+            &store, &config, wallet, telemetry, true, true,
+        )
+        .unwrap();
+        let session = new_session.state.active_session.as_ref().unwrap();
+        assert_ne!(session.id, old_session);
+        assert_eq!(session.authorized_exposure_wei.as_deref(), Some("0"));
+        assert_eq!(new_session.state.entries.len(), 1);
+    }
+
+    #[test]
+    fn legacy_archive_without_verification_marker_defaults_to_unverified() {
+        let wallet = Address::with_last_byte(0x77);
+        let entry = settled_history_entry(
+            Address::with_last_byte(1),
+            1,
+            wallet,
+            "legacy-archive",
+            7,
+            B256::with_last_byte(0x71),
+            TransactionAction::FinalizeWindow,
+            "window-finalized",
+            None,
+            0,
+        );
+        let mut encoded_entry = serde_json::to_value(entry).unwrap();
+        encoded_entry
+            .as_object_mut()
+            .unwrap()
+            .remove("receipt_verification");
+        let archive: super::JournalArchive = serde_json::from_value(serde_json::json!({
+            "version": super::ARCHIVE_VERSION,
+            "entries": [encoded_entry],
+        }))
+        .unwrap();
+
+        assert_eq!(
+            archive.entries[0].receipt_verification,
+            super::ReceiptVerification::LegacyUnverified
         );
     }
 
@@ -5819,10 +6876,36 @@ mod tests {
         history_rpc_server_with_log_failures(latest_block, response_delay, 0)
     }
 
+    fn history_rpc_server_for_recovery(
+        latest_block: u64,
+        response_delay: Duration,
+    ) -> HistoryRpcServer {
+        history_rpc_server_with_log_failures_and_recovery_queries(
+            latest_block,
+            response_delay,
+            0,
+            true,
+        )
+    }
+
     fn history_rpc_server_with_log_failures(
         latest_block: u64,
         response_delay: Duration,
         log_failures: usize,
+    ) -> HistoryRpcServer {
+        history_rpc_server_with_log_failures_and_recovery_queries(
+            latest_block,
+            response_delay,
+            log_failures,
+            false,
+        )
+    }
+
+    fn history_rpc_server_with_log_failures_and_recovery_queries(
+        latest_block: u64,
+        response_delay: Duration,
+        log_failures: usize,
+        allow_recovery_queries: bool,
     ) -> HistoryRpcServer {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -5878,6 +6961,14 @@ mod tests {
                             "timestamp": "0x1",
                             "hash": format!("{:#x}", B256::with_last_byte(0xaa)),
                         })
+                    }
+                    "eth_getTransactionByHash" | "eth_getTransactionReceipt"
+                        if allow_recovery_queries =>
+                    {
+                        serde_json::Value::Null
+                    }
+                    "eth_getTransactionCount" if allow_recovery_queries => {
+                        serde_json::Value::String("0x0".to_owned())
                     }
                     "eth_getLogs" => serde_json::Value::Array(Vec::new()),
                     other => panic!("unexpected history RPC method {other}"),
@@ -5993,6 +7084,7 @@ mod tests {
                     gas_limit: 21_000,
                     maximum_exposure_wei: "0".to_owned(),
                     status: TransactionStatus::MinedSuccess,
+                    receipt_verification: super::ReceiptVerification::LegacyUnverified,
                     actual_cost_wei: Some("0".to_owned()),
                     last_known_cost_wei: None,
                     outcome: Some("window-finalized".to_owned()),
@@ -6137,7 +7229,7 @@ mod tests {
         );
         assert_eq!(
             rpc_counts.lock().unwrap().get("eth_getBlockByNumber"),
-            Some(&2)
+            Some(&3)
         );
         assert!(manager.journal.state.entries.is_empty());
         assert_eq!(manager.journal.state.archives.len(), 1);
@@ -6199,6 +7291,7 @@ mod tests {
                     gas_limit: 21_000,
                     maximum_exposure_wei: "1".to_owned(),
                     status: TransactionStatus::MinedSuccess,
+                    receipt_verification: super::ReceiptVerification::LegacyUnverified,
                     actual_cost_wei: Some("1".to_owned()),
                     last_known_cost_wei: None,
                     outcome: Some("candidate-updated".to_owned()),
@@ -6395,6 +7488,7 @@ mod tests {
             gas_limit: 21_000,
             maximum_exposure_wei: "1".to_owned(),
             status: TransactionStatus::MinedSuccess,
+            receipt_verification: super::ReceiptVerification::LegacyUnverified,
             actual_cost_wei: Some("1".to_owned()),
             last_known_cost_wei: None,
             outcome: Some("candidate-updated".to_owned()),
@@ -7113,7 +8207,7 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_sink_uses_journaled_session_exposure_and_pending_activity() {
+    fn dashboard_sink_separates_authorization_from_rpc_reported_cost() {
         let root = tempdir().unwrap();
         let store = ConfigStore::at_root(PathBuf::from(root.path()));
         let config = AppConfig {
@@ -7136,7 +8230,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .as_ref()
-                .and_then(|state| state.session_exposure),
+                .and_then(|state| state.authorization_used),
             Some(U256::ZERO)
         );
 
@@ -7162,7 +8256,8 @@ mod tests {
         let state = latest.lock().unwrap().clone().unwrap();
         let maximum_exposure =
             request.value + U256::from(request.gas_limit) * request.max_fee_per_gas;
-        assert_eq!(state.session_exposure, Some(maximum_exposure));
+        assert_eq!(state.authorization_used, Some(maximum_exposure));
+        assert_eq!(state.actual_rpc_cost, Some(U256::ZERO));
         assert_eq!(
             state.activities,
             [TransactionActivity {
@@ -7317,6 +8412,7 @@ mod tests {
             .unwrap();
         let entry = &mut journal.state.entries[0];
         entry.status = TransactionStatus::MinedSuccess;
+        entry.receipt_verification = super::ReceiptVerification::LegacyUnverified;
         entry.actual_cost_wei = Some("100".to_owned());
         entry.outcome = Some("candidate-updated".to_owned());
         entry.receipt_block = Some(10);
@@ -7558,8 +8654,9 @@ mod tests {
                 value_wei: "0".to_owned(),
                 max_fee_per_gas_wei: "10".to_owned(),
                 gas_limit: 10,
-                maximum_exposure_wei: "100".to_owned(),
+                maximum_exposure_wei: "200".to_owned(),
                 status: TransactionStatus::MinedSuccess,
+                receipt_verification: super::ReceiptVerification::LegacyUnverified,
                 actual_cost_wei: Some("100".to_owned()),
                 last_known_cost_wei: None,
                 outcome: Some("window-finalized-winner:0x0:payout:0".to_owned()),
@@ -7606,8 +8703,8 @@ mod tests {
             (archived as u64 * 100).to_string()
         );
         assert_eq!(
-            journal.session_spent_or_reserved().unwrap(),
-            U256::from((super::ARCHIVE_TRIGGER_ENTRIES as u64) * 100)
+            journal.session_authorized_total().unwrap(),
+            U256::from((super::ARCHIVE_TRIGGER_ENTRIES as u64) * 200)
         );
         validate_archive_ledger(&store, &journal.state, None).unwrap();
         drop(journal);
@@ -7617,9 +8714,14 @@ mod tests {
             super::ARCHIVE_TRIGGER_ENTRIES - archived
         );
         assert_eq!(
-            reopened.session_spent_or_reserved().unwrap(),
-            U256::from((super::ARCHIVE_TRIGGER_ENTRIES as u64) * 100)
+            reopened.session_authorized_total().unwrap(),
+            U256::from((super::ARCHIVE_TRIGGER_ENTRIES as u64) * 200)
         );
+        drop(reopened);
+        let manager =
+            TransactionManager::open(&store, &config, wallet, Address::with_last_byte(0x88))
+                .unwrap();
+        assert_eq!(manager.legacy_unverified_settled_count().unwrap(), archived);
     }
 
     #[test]
@@ -7840,6 +8942,11 @@ mod tests {
             data: Bytes::from(event.encode_data()),
             block_number: None,
             block_hash: None,
+            transaction_hash: None,
+            transaction_index: None,
+            log_index: None,
+            removed: false,
+            virtual_log: false,
         };
         assert_eq!(
             verify_submission_events(
@@ -7882,6 +8989,11 @@ mod tests {
             data: Bytes::from(rejected.encode_data()),
             block_number: None,
             block_hash: None,
+            transaction_hash: None,
+            transaction_index: None,
+            log_index: None,
+            removed: false,
+            virtual_log: false,
         };
         assert_eq!(
             verify_submission_events(
@@ -7932,6 +9044,11 @@ mod tests {
                 data: Bytes::from(reward.encode_data()),
                 block_number: Some(20),
                 block_hash: Some(B256::with_last_byte(0x20)),
+                transaction_hash: None,
+                transaction_index: None,
+                log_index: None,
+                removed: false,
+                virtual_log: false,
             },
             RpcLog {
                 address: contract,
@@ -7943,6 +9060,11 @@ mod tests {
                 data: Bytes::from(finalized.encode_data()),
                 block_number: Some(20),
                 block_hash: Some(B256::with_last_byte(0x20)),
+                transaction_hash: None,
+                transaction_index: None,
+                log_index: None,
+                removed: false,
+                virtual_log: false,
             },
             RpcLog {
                 address: token,
@@ -7954,6 +9076,11 @@ mod tests {
                 data: Bytes::from(transfer.encode_data()),
                 block_number: Some(20),
                 block_hash: Some(B256::with_last_byte(0x20)),
+                transaction_hash: None,
+                transaction_index: None,
+                log_index: None,
+                removed: false,
+                virtual_log: false,
             },
         ];
         assert_eq!(
@@ -7961,6 +9088,200 @@ mod tests {
             (winner, payout)
         );
         assert!(verify_finalization_events(&logs[..2], contract, token, 9).is_err());
+    }
+
+    #[tokio::test]
+    async fn legacy_forward_reward_recovery_never_rebroadcasts_a_prepared_transfer() {
+        let root = tempdir().unwrap();
+        let store = ConfigStore::at_root(root.path().to_path_buf());
+        let config = AppConfig {
+            per_session_spending_limit_inj: "1".to_owned(),
+            ..AppConfig::default()
+        };
+        let wallet = Address::with_last_byte(0x31);
+        let miner = Address::with_last_byte(0x41);
+        let token = Address::with_last_byte(0x51);
+        let destination = Address::with_last_byte(0x61);
+        let (url, rpc_counts, stop_server, server) =
+            history_rpc_server_for_recovery(1, Duration::ZERO);
+        let client = NetworkClient::local_test_client(
+            &url,
+            miner,
+            B256::with_last_byte(0x81),
+            token,
+            B256::with_last_byte(0x82),
+            9,
+        )
+        .unwrap();
+        let mut manager = TransactionManager::open(&store, &config, wallet, token).unwrap();
+        let session_id = manager
+            .journal
+            .state
+            .active_session
+            .as_ref()
+            .unwrap()
+            .id
+            .clone();
+        let mut legacy = settled_history_entry(
+            token,
+            1,
+            wallet,
+            &session_id,
+            7,
+            B256::with_last_byte(0x71),
+            TransactionAction::ForwardReward,
+            "legacy-forwarding-transfer",
+            None,
+            0,
+        );
+        legacy.status = TransactionStatus::Prepared;
+        legacy.receipt_verification = super::ReceiptVerification::Unverified;
+        legacy.outcome = None;
+        legacy.actual_cost_wei = None;
+        legacy.receipt_block = None;
+        legacy.receipt_block_hash = None;
+        legacy.receipt_status = None;
+        legacy.reward_forward_destination = Some(format!("{destination:#x}"));
+        legacy.forward_payout_id = Some("1439:legacy:7".to_owned());
+        legacy.forward_source_proof_hash = Some(format!("{:#x}", B256::with_last_byte(0x72)));
+        legacy.forward_source_contract = Some(format!("{miner:#x}"));
+        legacy.forward_amount_wei = Some("100000000000".to_owned());
+        legacy.forward_reward_block = Some(20);
+        legacy.forward_reward_block_hash = Some(format!("{:#x}", B256::with_last_byte(0x20)));
+        manager.journal.state.entries.push(legacy);
+
+        manager.reconcile(&client).await.unwrap();
+
+        assert!(manager.journal.has_unresolved());
+        assert_eq!(
+            manager.journal.state.entries[0].status,
+            TransactionStatus::Prepared
+        );
+        assert_eq!(
+            manager.journal.session_authorized_total().unwrap(),
+            U256::from(1_000)
+        );
+        stop_server.store(true, Ordering::Release);
+        server.join().unwrap();
+        let observed_methods = rpc_counts.lock().unwrap();
+        assert!(!observed_methods.contains_key("eth_sendRawTransaction"));
+        assert!(observed_methods.contains_key("eth_getTransactionReceipt"));
+        assert!(observed_methods.contains_key("eth_getTransactionByHash"));
+    }
+
+    #[tokio::test]
+    async fn fabricated_eligible_reward_evidence_cannot_authorize_an_ast_transfer() {
+        let root = tempdir().unwrap();
+        let store = ConfigStore::at_root(root.path().to_path_buf());
+        let wallet = Address::with_last_byte(0x31);
+        let miner = Address::with_last_byte(0x41);
+        let token = Address::with_last_byte(0x51);
+        let destination = Address::with_last_byte(0x61);
+        let config = AppConfig {
+            minimum_reserve_inj: "0".to_owned(),
+            per_session_spending_limit_inj: "1".to_owned(),
+            ..AppConfig::default()
+        };
+        let mut manager = TransactionManager::open(&store, &config, wallet, token).unwrap();
+
+        // Model mutually consistent reward receipt/log data supplied by a malicious
+        // primary RPC: the parser can only see its own syntactically valid evidence.
+        let payout = U256::from(999_000_000_u64);
+        let source_hash = B256::with_last_byte(0x71);
+        let mut forged_source = settled_history_entry(
+            miner,
+            1,
+            wallet,
+            "forged-rpc-reward",
+            7,
+            source_hash,
+            TransactionAction::SubmitProof,
+            "candidate-updated",
+            Some(format!("reward-paid:{payout}")),
+            2,
+        );
+        forged_source.reward_forward_destination = Some(format!("{destination:#x}"));
+        forged_source.reward_forward_status = Some(RewardForwardingStatus::VerifiedEligible);
+        manager.journal.state.entries.push(forged_source);
+        assert!(matches!(
+            manager.configure_reward_forwarding(Some(destination)),
+            Err(error) if error.to_string().contains(AUTOMATIC_REWARD_FORWARDING_DISABLED)
+        ));
+        let forwarding = ForwardingIntent {
+            payout_id: "forged-rpc-payout".to_owned(),
+            source_proof_hash: source_hash,
+            source_contract: miner,
+            destination,
+            amount: payout,
+            reward_block: 20,
+            reward_block_hash: B256::with_last_byte(0x20),
+        };
+        let calldata = IERC20Read::transferCall {
+            to: destination,
+            amount: payout,
+        }
+        .abi_encode();
+        let intent = TransactionIntent {
+            contract: token,
+            node_id: 1,
+            window_id: 7,
+            action: TransactionAction::ForwardReward,
+            proof: None,
+            reward_destination: None,
+            forwarding: Some(forwarding),
+        };
+        let mut request = test_request();
+        request.to = token;
+        request.value = U256::ZERO;
+        request.data = calldata.clone();
+        assert!(matches!(
+            manager.journal.validate_exposure(
+                &request,
+                &intent,
+                parse_inj_wei("1").unwrap(),
+                U256::ZERO,
+                U256::MAX,
+            ),
+            Err(error) if error.to_string().contains(AUTOMATIC_REWARD_FORWARDING_DISABLED)
+        ));
+        assert!(matches!(
+            manager.journal.prepare(PreparedTransaction {
+                request: request.clone(),
+                tx_hash: B256::with_last_byte(0x91),
+                intent: intent.clone(),
+                session_limit: parse_inj_wei("1").unwrap(),
+                minimum_reserve: U256::ZERO,
+                confirmed_balance: U256::MAX,
+                confirmations_required: 2,
+            }),
+            Err(error) if error.to_string().contains(AUTOMATIC_REWARD_FORWARDING_DISABLED)
+        ));
+        let network = NetworkClient::local_test_client(
+            "http://127.0.0.1:1",
+            miner,
+            B256::with_last_byte(0x81),
+            token,
+            B256::with_last_byte(0x82),
+            9,
+        )
+        .unwrap();
+        let send_result = manager
+            .send(&network, &test_signer(), intent, U256::ZERO, calldata)
+            .await;
+        assert!(
+            matches!(send_result, Err(error) if error.to_string().contains(AUTOMATIC_REWARD_FORWARDING_DISABLED))
+        );
+        assert_eq!(manager.authorization_used().unwrap(), Some(U256::ZERO));
+        assert!(manager.journal.state.pending_authorization.is_none());
+        assert_eq!(manager.journal.state.entries.len(), 1);
+        assert!(
+            manager
+                .journal
+                .state
+                .entries
+                .iter()
+                .all(|entry| entry.action != TransactionAction::ForwardReward)
+        );
     }
 
     #[test]
@@ -7980,6 +9301,7 @@ mod tests {
             gas_limit: 10,
             maximum_exposure_wei: "200".into(),
             status: TransactionStatus::Broadcast,
+            receipt_verification: super::ReceiptVerification::Unverified,
             actual_cost_wei: None,
             last_known_cost_wei: None,
             outcome: None,
@@ -8009,9 +9331,14 @@ mod tests {
         };
         let receipt = TransactionReceipt {
             transaction_hash: B256::with_last_byte(1),
+            transaction_index: 0,
+            from: Address::from_str(&entry.wallet).unwrap(),
+            to: Some(Address::with_last_byte(1)),
             status: true,
             gas_used: U256::from(3),
+            cumulative_gas_used: U256::from(3),
             effective_gas_price: Some(U256::from(7)),
+            transaction_type: Some(2),
             block_number: 1,
             block_hash: B256::with_last_byte(1),
             logs: Vec::new(),
@@ -8618,6 +9945,7 @@ mod tests {
             let args = MineArgs {
                 device: test_device,
                 compute_only: !transaction_mode,
+                new_session: false,
                 threads: NonZeroUsize::new(4),
                 nodes: selected_nodes.clone(),
                 send_rewards_to: None,
@@ -9380,12 +10708,6 @@ mod tests {
                     .await
                     .unwrap();
             let deployment_wallet = Address::from_str(accounts[0].as_str().unwrap()).unwrap();
-            let forwarding_destination = (test_device == DeviceChoice::Gpu
-                && std::env::var("ASTATINE_E2E_FORWARD_GPU").as_deref() == Ok("1"))
-            .then_some(deployment_wallet);
-            assert!(forwarding_destination.is_none_or(|destination| destination != account));
-            let forwarding_destination_text =
-                forwarding_destination.map(|address| format!("{address:#x}"));
             let funded_balance = U256::from(1_000_u64) * U256::from(10_u8).pow(U256::from(18));
             rpc_request_local(
                 &rpc,
@@ -9405,7 +10727,6 @@ mod tests {
             let allocation = U256::from(1_000_u64) * token_unit;
             let total_allocation = allocation * U256::from(9_u8);
             let reward = U256::from(100_u64) * token_unit;
-            let reward_text = reward.to_string();
             let mut token_init = artifact_bytecode(&token_artifact);
             token_init.extend_from_slice(&abi_uint8_word(decimals));
             let token = deploy_unlocked(&rpc, &endpoint, deployment_wallet, &token_init).await;
@@ -9567,7 +10888,7 @@ mod tests {
                 wallet_address: Some(format!("{account:#x}")),
                 cpu_threads: 4,
                 minimum_reserve_inj: "0".to_owned(),
-                per_session_spending_limit_inj: "1".to_owned(),
+                per_session_spending_limit_inj: "10".to_owned(),
                 transaction_confirmations: 1,
                 ..AppConfig::default()
             };
@@ -9579,13 +10900,10 @@ mod tests {
             let args = MineArgs {
                 device: test_device,
                 compute_only: gpu_compute_only,
+                new_session: false,
                 threads: NonZeroUsize::new(4),
                 nodes: gpu_compute_nodes.clone().unwrap_or_else(|| vec![1, 3]),
-                send_rewards_to: if gpu_compute_only {
-                    None
-                } else {
-                    forwarding_destination
-                },
+                send_rewards_to: None,
             };
             let (probe_tx, probe_rx) = tokio::sync::oneshot::channel();
             let mut runtime = tokio::spawn(async move {
@@ -9962,35 +11280,11 @@ mod tests {
             )
             .await;
             assert!(first_rewarding_finalization.receipt_status.unwrap());
-            wait_for_verified_reward(&store, 1, 1, &probe.history_telemetry).await;
-            if forwarding_destination.is_some() {
-                let forwarded = wait_for_journal_entry_for_window(
-                    &store,
-                    1,
-                    TransactionAction::ForwardReward,
-                    1,
-                    TransactionStatus::MinedSuccess,
-                )
-                .await;
-                assert_eq!(
-                    forwarded.forward_amount_wei.as_deref(),
-                    Some(reward_text.as_str())
-                );
-            }
+            wait_for_verified_reward(&network, &store, 1, 1, &probe.history_telemetry).await;
             let rewarded_snapshot = network.snapshot(Some(account)).await.unwrap();
-            if forwarding_destination.is_some() {
-                assert_eq!(rewarded_snapshot.ast_balance, Some(U256::ZERO));
-                assert!(network
-                    .snapshot(forwarding_destination)
-                    .await
-                    .unwrap()
-                    .ast_balance
-                    .is_some_and(|balance| balance >= reward));
-            } else {
-                assert!(rewarded_snapshot
-                    .ast_balance
-                    .is_some_and(|balance| balance >= reward));
-            }
+            assert!(rewarded_snapshot
+                .ast_balance
+                .is_some_and(|balance| balance >= reward));
             wait_for_dashboard_mined_reward(&probe.transaction_state, reward).await;
             let second_window = wait_for_eligible_window(&network, 1, 2).await;
             wait_for_active_probe(&probe, 1, 2).await;
@@ -10023,6 +11317,7 @@ mod tests {
             );
             let _node3_window1_candidate = wait_for_candidate(&network, 3, 1, account).await;
             wait_for_no_unresolved_transactions(&store).await;
+            probe.proof_processing_gate.send_replace(true);
 
             rpc_request_local(
                 &rpc,
@@ -10119,8 +11414,9 @@ mod tests {
             )
             .await;
             assert!(node3_second_finalization.receipt_status.unwrap());
-            wait_for_verified_reward(&store, 1, 2, &probe.history_telemetry).await;
+            wait_for_verified_reward(&network, &store, 1, 2, &probe.history_telemetry).await;
             wait_for_verified_reward(
+                &network,
                 &store,
                 3,
                 node3_finalization_window,
@@ -10164,41 +11460,6 @@ mod tests {
                 .unwrap();
             assert_eq!(rewarded_windows.len(), 4);
             assert_eq!(expected_session_mined, reward * U256::from(4));
-            if forwarding_destination.is_some() {
-                let sources = rewarded_journal
-                    .entries
-                    .iter()
-                    .filter(|entry| {
-                        entry.action == TransactionAction::SubmitProof
-                            && entry.reward_confirmed
-                            && entry.reward_forward_destination.is_some()
-                            && entry
-                                .reward_outcome
-                                .as_deref()
-                                .is_some_and(|outcome| outcome.starts_with("reward-paid:"))
-                    })
-                    .map(|entry| (entry.node_id, entry.window_id))
-                    .collect::<HashSet<_>>();
-                assert_eq!(sources.len(), 4);
-                for (node_id, window_id) in sources {
-                    let forwarded = wait_for_journal_entry_for_window(
-                        &store,
-                        node_id,
-                        TransactionAction::ForwardReward,
-                        window_id,
-                        TransactionStatus::MinedSuccess,
-                    )
-                    .await;
-                    assert_eq!(
-                        forwarded.forward_amount_wei.as_deref(),
-                        Some(reward_text.as_str())
-                    );
-                    assert_eq!(
-                        forwarded.reward_forward_destination.as_deref(),
-                        forwarding_destination_text.as_deref()
-                    );
-                }
-            }
             assert_eq!(
                 wait_for_dashboard_mined_reward(&probe.transaction_state, expected_session_mined)
                     .await,
@@ -10206,37 +11467,17 @@ mod tests {
                 "the live dashboard must show every verified winning window from this invocation"
             );
             let cumulative_balance = network.snapshot(Some(account)).await.unwrap();
-            if let Some(destination) = forwarding_destination {
-                assert_eq!(cumulative_balance.ast_balance, Some(U256::ZERO));
-                assert_eq!(
-                    network.snapshot(Some(destination)).await.unwrap().ast_balance,
-                    Some(expected_session_mined)
-                );
-            } else {
-                assert_eq!(cumulative_balance.ast_balance, Some(expected_session_mined));
-            }
-            if forwarding_destination.is_some() {
-                wait_for_no_unresolved_transactions(&store).await;
-                probe.stop_signal.request_stop();
-                let result = tokio::time::timeout(Duration::from_secs(10), &mut runtime)
-                    .await
-                    .expect("GPU forwarding runtime should stop cleanly")
-                    .expect("GPU forwarding runtime task should join");
-                assert!(result.is_ok());
-                return;
-            }
-            if forwarding_destination.is_none() {
-                // Hold the next proof transaction in the local node so shutdown
-                // and journal recovery exercise the pending-broadcast path.
-                rpc_request_local(
-                    &rpc,
-                    &endpoint,
-                    "anvil_setAutomine",
-                    serde_json::json!([false]),
-                )
-                .await
-                .unwrap();
-            }
+            assert_eq!(cumulative_balance.ast_balance, Some(expected_session_mined));
+            // Hold the next proof transaction in the local node so shutdown
+            // and journal recovery exercise the pending-broadcast path.
+            rpc_request_local(
+                &rpc,
+                &endpoint,
+                "anvil_setAutomine",
+                serde_json::json!([false]),
+            )
+            .await
+            .unwrap();
             let third_window = wait_for_eligible_window(&network, 1, 3).await;
             wait_for_active_probe(&probe, 1, 3).await;
             let node3_third_window =
@@ -10250,6 +11491,7 @@ mod tests {
 
             let mut observer_updates = probe.observer_updates.clone();
             let _ = observer_updates.borrow_and_update();
+            probe.proof_processing_gate.send_replace(false);
             let pending_proof = wait_for_pending_proof(&store).await;
             assert!(matches!(pending_proof.node_id, 1 | 3));
             let pending_hash = entry_hash(&pending_proof).unwrap();
@@ -10290,9 +11532,10 @@ mod tests {
             let recovery_args = MineArgs {
                 device: test_device,
                 compute_only: false,
+                new_session: false,
                 threads: NonZeroUsize::new(1),
                 nodes: vec![pending_proof.node_id],
-                send_rewards_to: forwarding_destination,
+                send_rewards_to: None,
             };
             let (recovery_probe_tx, recovery_probe_rx) = tokio::sync::oneshot::channel();
             let mut recovery_runtime = tokio::spawn(async move {
@@ -10572,9 +11815,13 @@ mod tests {
         let dashboard_state = Arc::new(RwLock::new(TransactionDashboardState::default()));
         let dashboard_sink_state = Arc::clone(&dashboard_state);
         let mut manager = TransactionManager::open(&store, &config, wallet, token).unwrap();
-        manager
-            .configure_reward_forwarding(Some(forwarding_destination))
-            .unwrap();
+        assert!(
+            manager
+                .configure_reward_forwarding(Some(forwarding_destination))
+                .unwrap_err()
+                .to_string()
+                .contains("automatic AST reward forwarding is disabled")
+        );
         manager.set_dashboard_sink(Arc::new(move |state| {
             *dashboard_sink_state
                 .write()
@@ -10676,36 +11923,11 @@ mod tests {
                 .as_deref()
                 .is_some_and(|outcome| outcome.starts_with("reward-paid:"))
         );
-        assert_eq!(
-            first_reward_entry.reward_forward_status,
-            Some(RewardForwardingStatus::VerifiedEligible)
-        );
+        assert_eq!(first_reward_entry.reward_forward_status, None);
         assert_eq!(manager.mined_rewards_total(), reward);
         let paid_snapshot = network.snapshot(Some(wallet)).await.unwrap();
         assert_eq!(paid_snapshot.ast_balance, Some(reward));
-        let confirmed_native_balance = paid_snapshot.native_balance.unwrap();
-        rpc_request_local(
-            &rpc,
-            &endpoint,
-            "anvil_setBalance",
-            serde_json::json!([format!("{wallet:#x}"), "0x0"]),
-        )
-        .await
-        .unwrap();
-        let unfunded_snapshot = network.snapshot(Some(wallet)).await.unwrap();
-        assert!(
-            !manager
-                .service_reward_forwarding(&network, &unfunded_snapshot, &signer)
-                .await
-                .unwrap(),
-            "forwarding must be deferred without INJ gas funds"
-        );
         assert_eq!(manager.mined_rewards_total(), reward);
-        assert!(manager.journal.state.entries.iter().any(|entry| {
-            entry.action == TransactionAction::SubmitProof
-                && entry.window_id == 0
-                && entry.reward_forward_status == Some(RewardForwardingStatus::PolicyBlocked)
-        }));
         assert!(
             !manager
                 .journal
@@ -10713,99 +11935,12 @@ mod tests {
                 .entries
                 .iter()
                 .any(|entry| entry.action == TransactionAction::ForwardReward),
-            "an unfunded forwarding attempt must not be signed or journaled as a transfer"
-        );
-        rpc_request_local(
-            &rpc,
-            &endpoint,
-            "anvil_setBalance",
-            serde_json::json!([
-                format!("{wallet:#x}"),
-                format!("{confirmed_native_balance:#x}")
-            ]),
-        )
-        .await
-        .unwrap();
-        manager
-            .configure_reward_forwarding(Some(forwarding_destination))
-            .unwrap();
-        let paid_snapshot = network.snapshot(Some(wallet)).await.unwrap();
-        assert!(
-            manager
-                .service_reward_forwarding(&network, &paid_snapshot, &signer)
-                .await
-                .unwrap(),
-            "the confirmed third-party-finalized reward should start an authorized AST transfer"
-        );
-        let first_forward_hash = manager
-            .journal
-            .state
-            .entries
-            .iter()
-            .find(|entry| entry.action == TransactionAction::ForwardReward && entry.window_id == 0)
-            .map(|entry| entry_hash(entry).unwrap())
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while network
-                .transaction_receipt(first_forward_hash)
-                .await
-                .unwrap()
-                .is_none()
-            {
-                sleep(Duration::from_millis(25)).await;
-            }
-        })
-        .await
-        .expect("Anvil must include the first forwarding transaction before confirmations advance");
-        rpc_request_local(&rpc, &endpoint, "evm_mine", serde_json::json!([]))
-            .await
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let snapshot = network.snapshot(Some(wallet)).await.unwrap();
-                manager
-                    .monitor_at_snapshot(&network, &snapshot.block)
-                    .await
-                    .unwrap();
-                let source_confirmed = manager.journal.state.entries.iter().any(|entry| {
-                    entry.action == TransactionAction::SubmitProof
-                        && entry.window_id == 0
-                        && entry.reward_forward_status == Some(RewardForwardingStatus::Confirmed)
-                });
-                let transfer_confirmed = manager.journal.state.entries.iter().any(|entry| {
-                    entry.action == TransactionAction::ForwardReward
-                        && entry.window_id == 0
-                        && entry.status == TransactionStatus::MinedSuccess
-                });
-                if source_confirmed && transfer_confirmed {
-                    return;
-                }
-                sleep(Duration::from_millis(25)).await;
-            }
-        })
-        .await
-        .expect("the exact AST forwarding transfer must reach canonical receipt confirmation");
-        let forward_entry = manager
-            .journal
-            .state
-            .entries
-            .iter()
-            .find(|entry| entry.action == TransactionAction::ForwardReward && entry.window_id == 0)
-            .unwrap();
-        assert_eq!(forward_entry.status, TransactionStatus::MinedSuccess);
-        let reward_wei = reward.to_string();
-        assert_eq!(
-            forward_entry.forward_amount_wei.as_deref(),
-            Some(reward_wei.as_str())
-        );
-        assert_eq!(
-            forward_entry.reward_forward_destination.as_deref(),
-            Some(format!("{forwarding_destination:#x}").as_str())
+            "reward receipt reconciliation must not sign or journal an AST transfer"
         );
         assert_eq!(
             network.snapshot(Some(wallet)).await.unwrap().ast_balance,
-            Some(U256::ZERO),
-            "forwarding changes AST BALANCE but must not reverse session MINED"
+            Some(reward),
+            "verified reward reporting remains available while automatic forwarding is disabled"
         );
         assert_eq!(
             network
@@ -10813,8 +11948,8 @@ mod tests {
                 .await
                 .unwrap()
                 .ast_balance,
-            Some(reward),
-            "the external recipient receives exactly the verified reward"
+            Some(U256::ZERO),
+            "RPC reward evidence must not transfer AST to the configured destination"
         );
         assert_eq!(manager.mined_rewards_total(), reward);
         assert_eq!(
@@ -10825,14 +11960,6 @@ mod tests {
             reward,
             "forwarding must not decrement the current-invocation MINED total"
         );
-        assert!(
-            !manager
-                .service_reward_forwarding(&network, &paid_snapshot, &signer)
-                .await
-                .unwrap(),
-            "reconciling a completed payout must not broadcast a duplicate transfer"
-        );
-
         let second_snapshot = network.snapshot(Some(wallet)).await.unwrap();
         let second_work = second_snapshot
             .nodes
@@ -10983,7 +12110,7 @@ mod tests {
         .expect("the CLI proof that lost to the external contender must be reconciled");
 
         let current_wallet_balance = network.snapshot(Some(wallet)).await.unwrap();
-        assert_eq!(current_wallet_balance.ast_balance, Some(U256::ZERO));
+        assert_eq!(current_wallet_balance.ast_balance, Some(reward));
         let external_winner_balance = network
             .snapshot(Some(deployment_wallet))
             .await
@@ -11001,8 +12128,8 @@ mod tests {
                 .await
                 .unwrap()
                 .ast_balance,
-            Some(reward),
-            "the losing CLI proof must not create another destination transfer"
+            Some(U256::ZERO),
+            "RPC-derived reward events must not create destination transfers"
         );
         assert_eq!(
             manager
@@ -11012,8 +12139,8 @@ mod tests {
                 .iter()
                 .filter(|entry| entry.action == TransactionAction::ForwardReward)
                 .count(),
-            1,
-            "the losing proof must not schedule a second forwarding transfer"
+            0,
+            "reward reconciliation must not schedule any AST transfer"
         );
 
         let third_snapshot = network.snapshot(Some(wallet)).await.unwrap();
@@ -11079,60 +12206,37 @@ mod tests {
                     .monitor_at_snapshot(&network, &snapshot.block)
                     .await
                     .unwrap();
-                let forwarding_started = manager
-                    .service_reward_forwarding(&network, &snapshot, &signer)
-                    .await
-                    .unwrap();
-                if forwarding_started {
-                    let forward_hash = manager
-                        .journal
-                        .state
-                        .entries
-                        .iter()
-                        .find(|entry| {
-                            entry.action == TransactionAction::ForwardReward
-                                && entry.window_id == 2
-                        })
-                        .map(|entry| entry_hash(entry).unwrap())
-                        .unwrap();
-                    tokio::time::timeout(Duration::from_secs(10), async {
-                        while network
-                            .transaction_receipt(forward_hash)
-                            .await
-                            .unwrap()
-                            .is_none()
-                        {
-                            sleep(Duration::from_millis(25)).await;
-                        }
-                    })
-                    .await
-                    .expect("Anvil must include each forwarding transaction before confirmation blocks advance");
-                    rpc_request_local(&rpc, &endpoint, "evm_mine", serde_json::json!([]))
-                        .await
-                        .unwrap();
-                }
                 let source_confirmed = manager.journal.state.entries.iter().any(|entry| {
                     entry.action == TransactionAction::SubmitProof
                         && entry.window_id == 2
-                        && entry.reward_forward_status == Some(RewardForwardingStatus::Confirmed)
+                        && entry.reward_confirmed
+                        && entry
+                            .reward_outcome
+                            .as_deref()
+                            .is_some_and(|outcome| outcome.starts_with("reward-paid:"))
                 });
-                let transfer_confirmed = manager.journal.state.entries.iter().any(|entry| {
-                    entry.action == TransactionAction::ForwardReward
-                        && entry.window_id == 2
-                        && entry.status == TransactionStatus::MinedSuccess
-                });
-                if source_confirmed && transfer_confirmed {
+                let transfer_started = manager
+                    .journal
+                    .state
+                    .entries
+                    .iter()
+                    .any(|entry| entry.action == TransactionAction::ForwardReward);
+                assert!(
+                    !transfer_started,
+                    "reward RPC evidence must not initiate a transfer"
+                );
+                if source_confirmed {
                     return;
                 }
                 sleep(Duration::from_millis(25)).await;
             }
         })
         .await
-        .expect("the second eligible winning window must be forwarded once");
+        .expect("the second eligible winning window must be reported without forwarding");
         assert_eq!(manager.mined_rewards_total(), reward * U256::from(2));
         assert_eq!(
             network.snapshot(Some(wallet)).await.unwrap().ast_balance,
-            Some(U256::ZERO)
+            Some(reward * U256::from(2))
         );
         assert_eq!(
             network
@@ -11140,7 +12244,7 @@ mod tests {
                 .await
                 .unwrap()
                 .ast_balance,
-            Some(reward * U256::from(2))
+            Some(U256::ZERO)
         );
         assert_eq!(
             manager
@@ -11153,7 +12257,7 @@ mod tests {
                         && entry.status == TransactionStatus::MinedSuccess
                 })
                 .count(),
-            2
+            0
         );
         assert_eq!(
             dashboard_state
@@ -11166,18 +12270,14 @@ mod tests {
 
         drop(manager);
         let mut restarted = TransactionManager::open(&store, &config, wallet, token).unwrap();
-        restarted
-            .configure_reward_forwarding(Some(forwarding_destination))
-            .unwrap();
-        assert_eq!(restarted.mined_rewards_total(), U256::ZERO);
-        let restarted_snapshot = network.snapshot(Some(wallet)).await.unwrap();
         assert!(
-            !restarted
-                .service_reward_forwarding(&network, &restarted_snapshot, &signer)
-                .await
-                .unwrap(),
-            "explicitly resuming a completed payout must not send it twice"
+            restarted
+                .configure_reward_forwarding(Some(forwarding_destination))
+                .unwrap_err()
+                .to_string()
+                .contains("automatic AST reward forwarding is disabled")
         );
+        assert_eq!(restarted.mined_rewards_total(), U256::ZERO);
         assert_eq!(
             restarted
                 .journal
@@ -11186,7 +12286,7 @@ mod tests {
                 .iter()
                 .filter(|entry| entry.action == TransactionAction::ForwardReward)
                 .count(),
-            2
+            0
         );
         assert!(restarted.journal.state.entries.iter().any(|entry| {
             entry.action == TransactionAction::SubmitProof
@@ -11442,6 +12542,7 @@ mod tests {
             let args = MineArgs {
                 device: crate::cli::DeviceChoice::Cpu,
                 compute_only: false,
+                new_session: false,
                 threads: NonZeroUsize::new(32),
                 nodes: vec![1],
                 send_rewards_to: None,
@@ -11909,9 +13010,10 @@ mod tests {
             slots: Arc::clone(&observer_slots),
             schedule: Arc::clone(&observer_schedule),
             transaction_state: Arc::new(RwLock::new(TransactionDashboardState {
-                session_exposure: Some(
+                authorization_used: Some(
                     parse_decimal_wei(&broadcast_proof.maximum_exposure_wei).unwrap(),
                 ),
+                actual_rpc_cost: Some(U256::ZERO),
                 mined_rewards: U256::ZERO,
                 activities: vec![TransactionActivity {
                     node_id: 1,
@@ -11963,6 +13065,8 @@ mod tests {
             parse_decimal_wei(&broadcast_proof.maximum_exposure_wei).unwrap()
                 > U256::from(SUBMISSION_FEE_WEI)
         );
+        let authorization_at_broadcast =
+            parse_decimal_wei(&broadcast_proof.maximum_exposure_wei).unwrap();
         assert!(
             store
                 .read_transaction_journal()
@@ -11986,6 +13090,11 @@ mod tests {
         let _ = submit_task.await;
 
         let mut recovered = TransactionManager::open(&store, &config, account, token).unwrap();
+        assert_eq!(
+            recovered.journal.session_authorized_total().unwrap(),
+            authorization_at_broadcast,
+            "journal restart must retain the signed authorization counter"
+        );
         recovered.reconcile(&network).await.unwrap();
         let pending_recovered = recovered
             .journal
@@ -12245,6 +13354,7 @@ mod tests {
         .await;
         assert_eq!(U256::abi_decode_validate(&balance_bytes).unwrap(), reward);
 
+        let authorized_before_reorg = manager.journal.session_authorized_total().unwrap();
         let reverted = rpc_request_local(
             &client,
             &endpoint,
@@ -12265,6 +13375,11 @@ mod tests {
         assert_eq!(finalization_entry.status, TransactionStatus::Unknown);
         assert!(finalization_entry.last_known_cost_wei.is_some());
         assert!(manager.journal.pending_exposure().unwrap() > U256::ZERO);
+        assert_eq!(
+            manager.journal.session_authorized_total().unwrap(),
+            authorized_before_reorg,
+            "reorg recovery restores pending exposure but never refunds session authorization"
+        );
         let accepted = manager
             .journal
             .state
@@ -12765,7 +13880,7 @@ mod tests {
     }
 
     async fn wait_for_pending_proof(store: &ConfigStore) -> super::TransactionEntry {
-        tokio::time::timeout(Duration::from_secs(20), async {
+        match tokio::time::timeout(Duration::from_secs(20), async {
             loop {
                 if let Some(contents) = store.read_transaction_journal().unwrap() {
                     let state: super::JournalState = serde_json::from_slice(&contents).unwrap();
@@ -12780,7 +13895,49 @@ mod tests {
             }
         })
         .await
-        .expect("proof transaction did not reach journaled Broadcast state")
+        {
+            Ok(entry) => entry,
+            Err(_) => {
+                let state = store.read_transaction_journal().unwrap().map(|contents| {
+                    serde_json::from_slice::<super::JournalState>(&contents).unwrap()
+                });
+                let details = state.map_or_else(
+                    || "transaction journal is absent".to_owned(),
+                    |state| {
+                        let session = state.active_session.as_ref().map(|session| {
+                            format!(
+                                "authorized={}/{} wei, closed={}",
+                                session.authorized_exposure_wei.as_deref().unwrap_or("missing"),
+                                session.limit_wei,
+                                session.closed
+                            )
+                        });
+                        let recent_entries = state
+                            .entries
+                            .iter()
+                            .rev()
+                            .take(8)
+                            .map(|entry| {
+                                format!(
+                                    "{:?}/node{}/window{}/{:?}/max{}",
+                                    entry.action,
+                                    entry.node_id,
+                                    entry.window_id,
+                                    entry.status,
+                                    entry.maximum_exposure_wei
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!(
+                            "session={session:?}, pending_authorization={}, recent_entries=[{recent_entries}]",
+                            state.pending_authorization.is_some()
+                        )
+                    },
+                );
+                panic!("proof transaction did not reach journaled Broadcast state: {details}");
+            }
+        }
     }
 
     async fn wait_for_no_unresolved_transactions(store: &ConfigStore) {
@@ -12894,12 +14051,13 @@ mod tests {
     }
 
     async fn wait_for_verified_reward(
+        client: &NetworkClient,
         store: &ConfigStore,
         node_id: u8,
         window_id: u64,
         telemetry: &HistoryTelemetry,
     ) {
-        let verified = tokio::time::timeout(Duration::from_secs(20), async {
+        let verified = tokio::time::timeout(Duration::from_secs(60), async {
             loop {
                 if let Some(contents) = store.read_transaction_journal().unwrap() {
                     let journal: super::JournalState = serde_json::from_slice(&contents).unwrap();
@@ -12935,8 +14093,109 @@ mod tests {
                         .reward_scan_cursors
                         .get(&super::reward_scan_key(contract, window_id))
                 });
+            let related_entries = journal
+                .entries
+                .iter()
+                .filter(|entry| entry.node_id == node_id && entry.window_id == window_id)
+                .map(|entry| {
+                    format!(
+                        "{:?}/{:?}/outcome={:?}/reward={:?}/block={:?}/confirmed={}",
+                        entry.action,
+                        entry.status,
+                        entry.outcome,
+                        entry.reward_outcome,
+                        entry.reward_block,
+                        entry.reward_confirmed
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            let proof_entries = journal
+                .entries
+                .iter()
+                .filter(|entry| entry.action == TransactionAction::SubmitProof)
+                .map(|entry| {
+                    format!(
+                        "node={}/window={}/status={:?}/outcome={:?}/reward={:?}/confirmed={}",
+                        entry.node_id,
+                        entry.window_id,
+                        entry.status,
+                        entry.outcome,
+                        entry.reward_outcome,
+                        entry.reward_confirmed
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            let node_work = client
+                .snapshot(None)
+                .await
+                .ok()
+                .and_then(|snapshot| {
+                    let block_number = snapshot.block.number;
+                    snapshot
+                        .nodes
+                        .into_iter()
+                        .find(|node| node.id == node_id)
+                        .and_then(|node| {
+                            node.state.map(|state| {
+                                format!(
+                                    "block={} window={} started={} ended={}",
+                                    block_number,
+                                    state.work.window_id,
+                                    state.work.started,
+                                    state.work.ended
+                                )
+                            })
+                        })
+                })
+                .unwrap_or_else(|| "selected node snapshot unavailable".to_owned());
+            let queried_logs =
+                if let (Some(entry), Some(token)) =
+                    (
+                        entry,
+                        client.manifest.ast_token.as_ref().and_then(|token| {
+                            crate::deployment::parse_address(&token.address).ok()
+                        }),
+                    )
+                {
+                    match (
+                        Address::from_str(&entry.contract),
+                        client.latest_block_snapshot().await,
+                    ) {
+                        (Ok(contract), Ok(head)) => match client
+                            .window_finalization_logs_range(
+                                contract,
+                                token,
+                                window_id,
+                                entry.receipt_block.unwrap_or_default(),
+                                head.number,
+                            )
+                            .await
+                        {
+                            Ok(logs) => logs
+                                .iter()
+                                .map(|log| {
+                                    format!(
+                                        "{}:{:?}:{:?}:{:?}",
+                                        log.address,
+                                        log.topics.first(),
+                                        log.block_number,
+                                        log.transaction_hash
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join("; "),
+                            Err(error) => format!("query-error:{error:#}"),
+                        },
+                        (Err(error), _) => format!("contract-error:{error}"),
+                        (_, Err(error)) => format!("head-error:{error:#}"),
+                    }
+                } else {
+                    "no entry/token pin".to_owned()
+                };
             panic!(
-                "reward event for node {node_id} window {window_id} must be verified: entry={:?}, cursor={cursor:?}, anchor={:?}, {}",
+                "reward event for node {node_id} window {window_id} must be verified: entry={:?}, related=[{related_entries}], proofs=[{proof_entries}], node_work=[{node_work}], cursor={cursor:?}, cursors={:?}, anchor={:?}, queried_logs=[{queried_logs}], {}",
                 entry.map(|entry| (
                     entry.status,
                     entry.confirmations,
@@ -12944,6 +14203,7 @@ mod tests {
                     entry.reward_confirmations,
                     entry.reward_block_hash.is_some(),
                 )),
+                journal.reward_scan_cursors,
                 journal.reward_scan_anchor,
                 telemetry.format_profile(),
             )

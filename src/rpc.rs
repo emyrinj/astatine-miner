@@ -1,4 +1,5 @@
 use crate::{
+    config::validate_rpc_url,
     contracts::{AstatineMinerRead, IERC20Read},
     deployment::{DeploymentManifest, NodePin, parse_address, parse_hash},
     diagnostics::DiagnosticBuffer,
@@ -34,6 +35,21 @@ const SUBMISSION_FEE_WEI: u128 = 10_000_000_000_000_000;
 const ABI_PROBE_NONCE: u128 = u128::MAX - 7;
 const GENESIS_PROBE_CONCURRENCY: usize = 3;
 
+fn rpc_network_label(network: crate::cli::Network) -> &'static str {
+    match network {
+        crate::cli::Network::Testnet => "Testnet",
+        crate::cli::Network::Mainnet => "Mainnet",
+    }
+}
+
+fn report_archival_unavailable(progress: Option<&StartupProgress>, message: String) {
+    if let Some(progress) = progress {
+        progress.note(message);
+    } else {
+        eprintln!("{message}");
+    }
+}
+
 #[cfg(test)]
 fn consume_counter(counter: &AtomicUsize) -> bool {
     let mut remaining = counter.load(Ordering::Acquire);
@@ -53,7 +69,7 @@ fn consume_counter(counter: &AtomicUsize) -> bool {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkInfo {
     pub started: bool,
     pub ended: bool,
@@ -69,7 +85,7 @@ pub struct WorkInfo {
     pub submission_fee: U256,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CandidateInfo {
     pub miner: Address,
     pub nonce: u128,
@@ -90,7 +106,7 @@ pub struct MiningInfo {
     pub prev_hash: B256,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NodeState {
     pub work: WorkInfo,
     pub candidate: Option<CandidateInfo>,
@@ -114,26 +130,58 @@ pub struct RpcLog {
     pub data: Bytes,
     pub block_number: Option<u64>,
     pub block_hash: Option<B256>,
+    pub transaction_hash: Option<B256>,
+    pub transaction_index: Option<u64>,
+    pub log_index: Option<u64>,
+    pub removed: bool,
+    pub virtual_log: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransactionReceipt {
     pub transaction_hash: B256,
+    pub transaction_index: u64,
+    pub from: Address,
+    pub to: Option<Address>,
     pub status: bool,
     pub gas_used: U256,
+    pub cumulative_gas_used: U256,
     pub effective_gas_price: Option<U256>,
+    pub transaction_type: Option<u64>,
     pub block_number: u64,
     pub block_hash: B256,
     pub logs: Vec<RpcLog>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransactionDetails {
+    pub hash: B256,
+    pub chain_id: Option<u64>,
+    pub from: Address,
+    pub to: Option<Address>,
+    pub nonce: u64,
+    pub value: U256,
+    pub gas_limit: u64,
+    pub input: Bytes,
+    pub gas_price: Option<U256>,
+    pub max_fee_per_gas: Option<U256>,
+    pub max_priority_fee_per_gas: Option<U256>,
+    pub transaction_type: Option<u64>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ReceiptJson {
     transaction_hash: String,
+    transaction_index: String,
+    from: String,
+    to: Option<String>,
     status: String,
     gas_used: String,
+    cumulative_gas_used: String,
     effective_gas_price: Option<String>,
+    #[serde(default, rename = "type")]
+    transaction_type: Option<String>,
     block_number: String,
     block_hash: String,
     logs: Vec<ReceiptLogJson>,
@@ -147,13 +195,32 @@ struct ReceiptLogJson {
     data: String,
     block_number: Option<String>,
     block_hash: Option<String>,
+    transaction_hash: Option<String>,
+    transaction_index: Option<String>,
+    log_index: Option<String>,
+    #[serde(default)]
+    removed: bool,
+    #[serde(default, rename = "virtual")]
+    virtual_log: bool,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct TransactionSenderJson {
+struct TransactionJson {
     hash: String,
+    chain_id: Option<String>,
     from: String,
+    to: Option<String>,
+    nonce: String,
+    value: String,
+    gas: String,
+    #[serde(alias = "data")]
+    input: String,
+    gas_price: Option<String>,
+    max_fee_per_gas: Option<String>,
+    max_priority_fee_per_gas: Option<String>,
+    #[serde(default, rename = "type")]
+    transaction_type: Option<String>,
 }
 
 impl TryFrom<ReceiptJson> for TransactionReceipt {
@@ -171,16 +238,70 @@ impl TryFrom<ReceiptJson> for TransactionReceipt {
         }
         Ok(Self {
             transaction_hash: parse_hash(&receipt.transaction_hash)?,
+            transaction_index: parse_hex_quantity(&receipt.transaction_index)?,
+            from: parse_address(&receipt.from)?,
+            to: receipt.to.as_deref().map(parse_address).transpose()?,
             status: status == 1,
             gas_used: parse_hex_u256(&receipt.gas_used)?,
+            cumulative_gas_used: parse_hex_u256(&receipt.cumulative_gas_used)?,
             effective_gas_price: receipt
                 .effective_gas_price
                 .as_deref()
                 .map(parse_hex_u256)
                 .transpose()?,
+            transaction_type: receipt
+                .transaction_type
+                .as_deref()
+                .map(parse_hex_quantity)
+                .transpose()?,
             block_number: parse_hex_quantity(&receipt.block_number)?,
             block_hash: parse_hash(&receipt.block_hash)?,
             logs,
+        })
+    }
+}
+
+impl TryFrom<TransactionJson> for TransactionDetails {
+    type Error = anyhow::Error;
+
+    fn try_from(transaction: TransactionJson) -> Result<Self> {
+        let input = transaction
+            .input
+            .strip_prefix("0x")
+            .context("transaction input has no 0x prefix")?;
+        Ok(Self {
+            hash: parse_hash(&transaction.hash)?,
+            chain_id: transaction
+                .chain_id
+                .as_deref()
+                .map(parse_hex_quantity)
+                .transpose()?,
+            from: parse_address(&transaction.from)?,
+            to: transaction.to.as_deref().map(parse_address).transpose()?,
+            nonce: parse_hex_quantity(&transaction.nonce)?,
+            value: parse_hex_u256(&transaction.value)?,
+            gas_limit: parse_hex_quantity(&transaction.gas)?,
+            input: Bytes::from(hex::decode(input).context("decode transaction input")?),
+            gas_price: transaction
+                .gas_price
+                .as_deref()
+                .map(parse_hex_u256)
+                .transpose()?,
+            max_fee_per_gas: transaction
+                .max_fee_per_gas
+                .as_deref()
+                .map(parse_hex_u256)
+                .transpose()?,
+            max_priority_fee_per_gas: transaction
+                .max_priority_fee_per_gas
+                .as_deref()
+                .map(parse_hex_u256)
+                .transpose()?,
+            transaction_type: transaction
+                .transaction_type
+                .as_deref()
+                .map(parse_hex_quantity)
+                .transpose()?,
         })
     }
 }
@@ -211,7 +332,7 @@ pub struct ReadSnapshot {
     pub nodes: Vec<NodeView>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContractPinStatus {
     pub runtime_verified: bool,
     pub abi_verified: bool,
@@ -236,6 +357,8 @@ pub struct DeploymentVerification {
 pub struct NetworkClient {
     pub manifest: DeploymentManifest,
     endpoints: Vec<RpcEndpoint>,
+    archival_endpoint: Option<RpcEndpoint>,
+    custom_primary: bool,
     pub verification: DeploymentVerification,
     /// Nodes whose started work has passed the activation-time runtime/ABI/PoW check.
     /// Entries are cleared when genesis is absent or a canonical reorg is observed.
@@ -318,12 +441,16 @@ impl Drop for GenesisProbeConcurrencyGuard {
 }
 
 impl NetworkClient {
-    pub async fn connect(network: crate::cli::Network) -> Result<Self> {
-        Self::connect_with_progress(network, None).await
+    pub async fn connect_with_rpc(
+        network: crate::cli::Network,
+        rpc_override: Option<&str>,
+    ) -> Result<Self> {
+        Self::connect_with_progress(network, rpc_override, None).await
     }
 
     pub(crate) async fn connect_with_progress(
         network: crate::cli::Network,
+        rpc_override: Option<&str>,
         progress: Option<&StartupProgress>,
     ) -> Result<Self> {
         let manifest = match DeploymentManifest::load(network) {
@@ -335,72 +462,70 @@ impl NetworkClient {
                 return Err(error);
             }
         };
-        let configured = std::iter::once(("primary", manifest.primary_rpc.as_str())).chain(
-            manifest
-                .archival_rpc
-                .as_deref()
-                .map(|url| ("archival", url)),
-        );
-        let mut endpoints = Vec::new();
-        let mut endpoint_errors = Vec::new();
+        let custom_primary = rpc_override.is_some();
+        let primary_url = rpc_override.unwrap_or(&manifest.primary_rpc);
+        validate_rpc_url(primary_url).context("selected RPC URL is invalid")?;
+        if let Some(progress) = progress {
+            progress.update("Connecting to selected RPC · validating Chain ID");
+        }
+        let primary = connect_endpoint("primary", primary_url)
+            .await
+            .context("connect to the selected RPC endpoint")?;
+        let chain_id = rpc_request::<String>(&primary, "eth_chainId", serde_json::json!([]))
+            .await
+            .and_then(|chain| parse_hex_quantity(&chain))
+            .context("read chain ID from the selected RPC endpoint")?;
+        if chain_id != manifest.chain_id {
+            bail!(
+                "selected RPC reports chain ID {chain_id}; expected {} for {}",
+                manifest.chain_id,
+                rpc_network_label(network)
+            );
+        }
 
-        for (name, url) in configured {
-            if let Some(progress) = progress {
-                progress.update(format!("Connecting to {name} RPC · validating Chain ID"));
-            }
-            match connect_endpoint(name, url).await {
+        let mut archival_endpoint = None;
+        if !custom_primary && let Some(archival_url) = manifest.archival_rpc.as_deref() {
+            match connect_endpoint("archival", archival_url).await {
                 Ok(endpoint) => {
-                    match rpc_request::<String>(&endpoint, "eth_chainId", serde_json::json!([]))
-                        .await
-                        .and_then(|chain| parse_hex_quantity(&chain))
-                    {
-                        Ok(chain_id) if chain_id == manifest.chain_id => endpoints.push(endpoint),
-                        Ok(chain_id) => endpoint_errors.push(format!(
-                            "RPC {} reports chain ID {}; expected {}",
-                            endpoint.name, chain_id, manifest.chain_id
-                        )),
-                        Err(error) => {
-                            endpoint_errors.push(format!(
-                                "RPC {} Chain ID check failed: {error:#}",
-                                endpoint.name
-                            ));
+                    let archival_chain =
+                        rpc_request::<String>(&endpoint, "eth_chainId", serde_json::json!([]))
+                            .await
+                            .and_then(|chain| parse_hex_quantity(&chain));
+                    match archival_chain {
+                        Ok(chain) if chain == manifest.chain_id => {
+                            archival_endpoint = Some(endpoint);
                         }
+                        Ok(chain) => report_archival_unavailable(
+                            progress,
+                            format!(
+                                "bundled archival RPC reports chain ID {chain}; expected {}",
+                                manifest.chain_id
+                            ),
+                        ),
+                        Err(error) => report_archival_unavailable(
+                            progress,
+                            format!("bundled archival RPC is unavailable: {error:#}"),
+                        ),
                     }
                 }
-                Err(error) => endpoint_errors.push(format!("RPC {name} unavailable: {error:#}")),
+                Err(error) => report_archival_unavailable(
+                    progress,
+                    format!("bundled archival RPC is unavailable: {error:#}"),
+                ),
             }
-        }
-        if endpoints.is_empty() {
-            let error = anyhow::anyhow!(
-                "no configured RPC endpoint reports the expected chain ID {}",
-                manifest.chain_id
-            );
-            let details = if endpoint_errors.is_empty() {
-                format!("{error:#}")
-            } else {
-                format!("{error:#}: {}", endpoint_errors.join("; "))
-            };
-            if let Some(progress) = progress {
-                progress.fail(format!(
-                    "RPC connection or Chain ID validation failed: {details}"
-                ));
-            }
-            return Err(anyhow::anyhow!(details));
         }
         if let Some(progress) = progress {
-            progress.complete(format!("RPC verified · Chain ID {}", manifest.chain_id));
-            for error in endpoint_errors {
-                progress.note(error);
-            }
-        } else {
-            for error in endpoint_errors {
-                eprintln!("{error}");
+            progress.complete(format!("Selected RPC verified · Chain ID {chain_id}"));
+            if custom_primary && manifest.archival_rpc.is_some() {
+                progress.note("Bundled archival endpoint is not used as a custom-RPC fallback.");
             }
         }
 
         let mut client = Self {
             manifest,
-            endpoints,
+            endpoints: vec![primary],
+            archival_endpoint,
+            custom_primary,
             activation_work: Arc::new(Mutex::new(HashSet::new())),
             diagnostics: None,
             history_telemetry: Arc::new(HistoryTelemetry::default()),
@@ -436,6 +561,24 @@ impl NetworkClient {
         };
         client.verify_deployment(progress).await?;
         Ok(client)
+    }
+
+    pub async fn validate_rpc_endpoint(network: crate::cli::Network, url: &str) -> Result<()> {
+        let manifest = DeploymentManifest::load(network)?;
+        validate_rpc_url(url).context("custom RPC URL is invalid")?;
+        let endpoint = connect_endpoint("validation", url).await?;
+        let chain_id = rpc_request::<String>(&endpoint, "eth_chainId", serde_json::json!([]))
+            .await
+            .and_then(|chain| parse_hex_quantity(&chain))
+            .context("custom RPC did not return a valid chain ID")?;
+        if chain_id != manifest.chain_id {
+            bail!(
+                "custom RPC reports chain ID {chain_id}; expected {} for {}",
+                manifest.chain_id,
+                rpc_network_label(network)
+            );
+        }
+        Ok(())
     }
 
     pub fn set_diagnostics(&mut self, diagnostics: DiagnosticBuffer) {
@@ -474,12 +617,19 @@ impl NetworkClient {
             .iter()
             .find(|pin| pin.id == node_id)
             .with_context(|| format!("node {node_id} is absent from the verified manifest"))?;
-        let endpoint = self.primary_endpoint()?;
+        let endpoints = self.trusted_rpc_endpoints()?;
         let address = parse_address(&pin.address)?;
         let expected_hash = parse_hash(&pin.runtime_code_hash)?;
-        let code = get_code(endpoint, address, block).await?;
-        if code.is_empty() || keccak256(code) != expected_hash {
-            bail!("node {node_id} runtime code no longer matches the approved pin");
+        for endpoint in &endpoints {
+            let code = get_code(endpoint, address, block)
+                .await
+                .with_context(|| format!("read node {node_id} code from {}", endpoint.name))?;
+            if code.is_empty() || keccak256(code) != expected_hash {
+                bail!(
+                    "node {node_id} runtime code from {} no longer matches the approved pin",
+                    endpoint.name
+                );
+            }
         }
         let status = self
             .verification
@@ -500,9 +650,17 @@ impl NetworkClient {
             .context("AST token is absent from the verified manifest")?;
         let address = parse_address(&pin.address)?;
         let expected_hash = parse_hash(&pin.runtime_code_hash)?;
-        let code = get_code(self.primary_endpoint()?, address, block).await?;
-        if code.is_empty() || keccak256(code) != expected_hash {
-            bail!("AST token runtime code no longer matches the approved pin");
+        let endpoints = self.trusted_rpc_endpoints()?;
+        for endpoint in &endpoints {
+            let code = get_code(endpoint, address, block)
+                .await
+                .with_context(|| format!("read AST token code from {}", endpoint.name))?;
+            if code.is_empty() || keccak256(code) != expected_hash {
+                bail!(
+                    "AST token runtime code from {} no longer matches the approved pin",
+                    endpoint.name
+                );
+            }
         }
         if !self.verification.token_verified {
             bail!("AST token runtime or decimals are not verified");
@@ -511,51 +669,84 @@ impl NetworkClient {
     }
 
     pub async fn verify_broadcast_snapshot(&self, snapshot: &BlockSnapshot) -> Result<()> {
-        let endpoint = self.primary_endpoint()?;
-        let (latest_number, _) = endpoint_block(endpoint).await?;
-        if latest_number < snapshot.number {
-            bail!(
-                "primary RPC is behind the verified work snapshot ({} < {})",
-                latest_number,
-                snapshot.number
-            );
-        }
-        let primary_block = block_at(endpoint, snapshot.number).await?;
-        if primary_block.hash != snapshot.hash {
-            bail!("primary RPC disagrees with the verified work snapshot; refusing to broadcast");
+        let endpoints = self.trusted_rpc_endpoints()?;
+        for endpoint in &endpoints {
+            let (latest_number, _) = endpoint_block(endpoint)
+                .await
+                .with_context(|| format!("read latest financial head from {}", endpoint.name))?;
+            if latest_number < snapshot.number {
+                bail!(
+                    "RPC {} is behind the verified work snapshot ({} < {})",
+                    endpoint.name,
+                    latest_number,
+                    snapshot.number
+                );
+            }
+            let financial_block = block_at(endpoint, snapshot.number)
+                .await
+                .with_context(|| format!("read snapshot block from {}", endpoint.name))?;
+            if financial_block.hash != snapshot.hash {
+                bail!(
+                    "RPC {} disagrees with the verified work snapshot; refusing to broadcast",
+                    endpoint.name
+                );
+            }
         }
         Ok(())
     }
 
     pub async fn pending_balance(&self, address: Address) -> Result<U256> {
-        let result = rpc_request::<String>(
-            self.primary_endpoint()?,
-            "eth_getBalance",
-            serde_json::json!([format!("{address:#x}"), "pending"]),
-        )
-        .await?;
-        parse_hex_u256(&result)
+        let endpoints = self.trusted_rpc_endpoints()?;
+        let mut balances = Vec::with_capacity(endpoints.len());
+        for endpoint in &endpoints {
+            let result = rpc_request::<String>(
+                endpoint,
+                "eth_getBalance",
+                serde_json::json!([format!("{address:#x}"), "pending"]),
+            )
+            .await
+            .with_context(|| format!("read pending balance from {}", endpoint.name))?;
+            balances.push(parse_hex_u256(&result)?);
+        }
+        let balance = *balances
+            .first()
+            .context("pending balance endpoint is unavailable")?;
+        if balances.iter().any(|other| *other != balance) {
+            bail!("selected RPC returned inconsistent pending INJ balance data");
+        }
+        Ok(balance)
     }
 
     pub async fn pending_nonce(&self, address: Address) -> Result<u64> {
         self.history_telemetry.add(HistoryCounter::NonceRequests, 1);
-        let started = Instant::now();
-        let result = rpc_request::<String>(
-            self.primary_endpoint()?,
-            "eth_getTransactionCount",
-            serde_json::json!([format!("{address:#x}"), "pending"]),
-        )
-        .await;
-        self.history_telemetry
-            .add_elapsed(HistoryDuration::HistoricalRpc, started.elapsed());
-        let result = match result {
-            Ok(result) => result,
-            Err(error) => {
-                self.history_telemetry.add(HistoryCounter::RpcErrors, 1);
-                return Err(error);
+        let endpoints = self.trusted_rpc_endpoints()?;
+        let mut nonces = Vec::with_capacity(endpoints.len());
+        for endpoint in &endpoints {
+            let endpoint_started = Instant::now();
+            let result = rpc_request::<String>(
+                endpoint,
+                "eth_getTransactionCount",
+                serde_json::json!([format!("{address:#x}"), "pending"]),
+            )
+            .await;
+            self.history_telemetry
+                .add_elapsed(HistoryDuration::HistoricalRpc, endpoint_started.elapsed());
+            match result {
+                Ok(result) => nonces.push(parse_hex_quantity(&result)?),
+                Err(error) => {
+                    self.history_telemetry.add(HistoryCounter::RpcErrors, 1);
+                    return Err(error)
+                        .with_context(|| format!("read pending nonce from {}", endpoint.name));
+                }
             }
-        };
-        parse_hex_quantity(&result)
+        }
+        let nonce = *nonces
+            .first()
+            .context("pending nonce endpoint is unavailable")?;
+        if nonces.iter().any(|other| *other != nonce) {
+            bail!("selected RPC returned inconsistent wallet pending nonce data");
+        }
+        Ok(nonce)
     }
 
     pub async fn fee_quote(
@@ -669,154 +860,86 @@ impl NetworkClient {
     }
 
     pub async fn transaction_known(&self, hash: B256) -> Result<bool> {
-        let mut saw_pending = false;
-        let mut errors = Vec::new();
-        let mut retrying_after_error = false;
-        for endpoint in &self.endpoints {
-            if retrying_after_error {
-                self.history_telemetry.add(HistoryCounter::RpcRetries, 1);
-            }
-            self.history_telemetry
-                .add(HistoryCounter::TransactionLookupRequests, 1);
-            let started = Instant::now();
-            let result = rpc_request::<Option<serde_json::Value>>(
-                endpoint,
-                "eth_getTransactionByHash",
-                serde_json::json!([format!("{hash:#x}")]),
-            )
-            .await;
-            self.history_telemetry
-                .add_elapsed(HistoryDuration::HistoricalRpc, started.elapsed());
-            match result {
-                Ok(Some(_)) => return Ok(true),
-                Ok(None) => saw_pending = true,
-                Err(error) => {
-                    self.history_telemetry.add(HistoryCounter::RpcErrors, 1);
-                    retrying_after_error = true;
-                    errors.push(format!("{}: {error:#}", endpoint.name));
-                }
-            }
-        }
-        if !saw_pending && !errors.is_empty() {
-            bail!(
-                "all configured RPC endpoints failed to look up transaction {hash:#x}: {}",
-                errors.join("; ")
-            );
-        }
-        Ok(false)
+        Ok(self.transaction_details(hash).await?.is_some())
     }
 
     pub async fn transaction_sender(&self, hash: B256) -> Result<Option<Address>> {
-        let mut sender = None;
-        let mut last_error = None;
-        let mut retrying_after_error = false;
-        for endpoint in &self.endpoints {
-            if retrying_after_error {
-                self.history_telemetry.add(HistoryCounter::RpcRetries, 1);
-            }
-            self.history_telemetry
-                .add(HistoryCounter::TransactionLookupRequests, 1);
-            let started = Instant::now();
-            let result = rpc_request::<Option<TransactionSenderJson>>(
-                endpoint,
-                "eth_getTransactionByHash",
-                serde_json::json!([format!("{hash:#x}")]),
-            )
-            .await;
-            self.history_telemetry
-                .add_elapsed(HistoryDuration::HistoricalRpc, started.elapsed());
-            match result {
-                Ok(Some(transaction)) => {
-                    if parse_hash(&transaction.hash)? != hash {
-                        bail!("RPC returned a different transaction while recovering sender");
-                    }
-                    let observed = parse_address(&transaction.from)?;
-                    if sender.is_some_and(|previous| previous != observed) {
-                        bail!("RPC endpoints disagree on recovered transaction sender");
-                    }
-                    sender = Some(observed);
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    self.history_telemetry.add(HistoryCounter::RpcErrors, 1);
-                    retrying_after_error = true;
-                    last_error = Some(error);
-                }
-            }
-        }
-        if sender.is_some() {
-            return Ok(sender);
-        }
-        if let Some(error) = last_error {
-            return Err(error).context("recover transaction sender from configured RPC endpoints");
-        }
-        Ok(None)
+        Ok(self
+            .transaction_details(hash)
+            .await?
+            .map(|transaction| transaction.from))
     }
 
     pub async fn transaction_receipt(&self, hash: B256) -> Result<Option<TransactionReceipt>> {
-        let mut endpoint_errors = Vec::new();
-        let mut verified_receipt = None;
-        let mut saw_pending = false;
-        let mut retrying_after_error = false;
-        for endpoint in &self.endpoints {
-            if retrying_after_error {
-                self.history_telemetry.add(HistoryCounter::RpcRetries, 1);
+        let endpoint = self.primary_endpoint()?;
+        self.history_telemetry
+            .add(HistoryCounter::ReceiptRequests, 1);
+        let started = Instant::now();
+        let result = rpc_request::<Option<ReceiptJson>>(
+            endpoint,
+            "eth_getTransactionReceipt",
+            serde_json::json!([format!("{hash:#x}")]),
+        )
+        .await;
+        self.history_telemetry
+            .add_elapsed(HistoryDuration::HistoricalRpc, started.elapsed());
+        match result {
+            Ok(Some(receipt)) => {
+                let receipt = TransactionReceipt::try_from(receipt)
+                    .with_context(|| format!("decode receipt reported by {}", endpoint.name))?;
+                if receipt.transaction_hash != hash {
+                    bail!("selected RPC returned a receipt for a different transaction hash");
+                }
+                validate_trusted_rpc_receipt(&receipt)
+                    .context("validate receipt shape and transaction metadata")?;
+                Ok(Some(receipt))
             }
-            self.history_telemetry
-                .add(HistoryCounter::ReceiptRequests, 1);
-            let started = Instant::now();
-            let result = rpc_request::<Option<ReceiptJson>>(
-                endpoint,
-                "eth_getTransactionReceipt",
-                serde_json::json!([format!("{hash:#x}")]),
-            )
-            .await;
-            self.history_telemetry
-                .add_elapsed(HistoryDuration::HistoricalRpc, started.elapsed());
-            match result {
-                Ok(Some(receipt)) => {
-                    let receipt = TransactionReceipt::try_from(receipt).with_context(|| {
-                        format!("decode transaction receipt from {}", endpoint.name)
-                    })?;
-                    if let Some(previous) = &mut verified_receipt {
-                        if !receipts_agree(previous, &receipt) {
-                            bail!(
-                                "RPC endpoints disagree on transaction receipt {hash:#x}; refusing an uncorroborated result"
-                            );
-                        }
-                        if previous.effective_gas_price.is_none() {
-                            previous.effective_gas_price = receipt.effective_gas_price;
-                        }
-                    } else {
-                        verified_receipt = Some(receipt);
-                    }
-                }
-                Ok(None) => saw_pending = true,
-                Err(error) => {
-                    self.history_telemetry.add(HistoryCounter::RpcErrors, 1);
-                    retrying_after_error = true;
-                    endpoint_errors.push(format!("{}: {error:#}", endpoint.name));
-                }
+            Ok(None) => Ok(None),
+            Err(error) if is_transient_rpc_error(&error) => {
+                self.history_telemetry.add(HistoryCounter::RpcErrors, 1);
+                Err(anyhow::Error::new(ReceiptStatusUnavailable {
+                    details: format!(
+                        "selected RPC receipt request is temporarily unavailable: {error:#}"
+                    ),
+                }))
+            }
+            Err(error) => {
+                self.history_telemetry.add(HistoryCounter::RpcErrors, 1);
+                Err(error).context("read transaction receipt from the selected trusted RPC")
             }
         }
-        if let Some(receipt) = verified_receipt {
-            return Ok(Some(receipt));
-        }
-        if saw_pending && endpoint_errors.is_empty() {
+    }
+
+    pub async fn transaction_details(&self, hash: B256) -> Result<Option<TransactionDetails>> {
+        let endpoint = self.primary_endpoint()?;
+        self.history_telemetry
+            .add(HistoryCounter::TransactionLookupRequests, 1);
+        let started = Instant::now();
+        let result = rpc_request::<Option<TransactionJson>>(
+            endpoint,
+            "eth_getTransactionByHash",
+            serde_json::json!([format!("{hash:#x}")]),
+        )
+        .await;
+        self.history_telemetry
+            .add_elapsed(HistoryDuration::HistoricalRpc, started.elapsed());
+        let transaction = match result {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                self.history_telemetry.add(HistoryCounter::RpcErrors, 1);
+                return Err(error)
+                    .context("read transaction details from the selected trusted RPC");
+            }
+        };
+        let Some(transaction) = transaction else {
             return Ok(None);
+        };
+        let transaction = TransactionDetails::try_from(transaction)
+            .context("decode transaction details reported by the selected RPC")?;
+        if transaction.hash != hash {
+            bail!("selected RPC returned transaction details for a different hash");
         }
-        if !endpoint_errors.is_empty() {
-            let status = if saw_pending {
-                "some endpoints returned pending while other endpoints failed"
-            } else {
-                "all configured endpoints failed"
-            };
-            return Err(anyhow::Error::new(ReceiptStatusUnavailable {
-                details: format!("{status}: {}", endpoint_errors.join("; ")),
-            }))
-            .context("read transaction receipt from configured RPC endpoints");
-        }
-        Ok(None)
+        Ok(Some(transaction))
     }
 
     pub(crate) async fn window_finalization_logs_range(
@@ -833,39 +956,112 @@ impl NetworkClient {
         if to_block.saturating_sub(from_block) >= MAX_LOG_QUERY_RANGE {
             bail!("reward history range exceeds the bounded RPC log-query size");
         }
-        let mut errors = Vec::new();
-        let mut found_empty = false;
-        let mut retrying_after_error = false;
-        for endpoint in &self.endpoints {
-            if retrying_after_error {
-                self.history_telemetry.add(HistoryCounter::RpcRetries, 1);
+        let primary = self.primary_endpoint()?;
+        let mut logs = match window_finalization_logs_range_at(
+            primary,
+            address,
+            token,
+            window_id,
+            from_block,
+            to_block,
+            &self.history_telemetry,
+        )
+        .await
+        {
+            Ok(logs) => logs,
+            Err(primary_error) if !self.custom_primary => {
+                let Some(archival) = self.archival_endpoint() else {
+                    return Err(primary_error)
+                        .context("read historical reward logs from selected RPC");
+                };
+                self.report_diagnostic(format!(
+                    "Selected primary RPC could not serve historical reward logs for node {} window {}; reading the bundled archival endpoint as a historical fallback: {primary_error:#}",
+                    address, window_id
+                ));
+                window_finalization_logs_range_at(
+                    archival,
+                    address,
+                    token,
+                    window_id,
+                    from_block,
+                    to_block,
+                    &self.history_telemetry,
+                )
+                .await
+                .context("read historical reward logs from bundled archival fallback")?
             }
-            match window_finalization_logs_range_at(
-                endpoint,
-                address,
-                token,
-                window_id,
-                from_block,
-                to_block,
-                &self.history_telemetry,
+            Err(error) => {
+                return Err(error).context("read historical reward logs from selected custom RPC");
+            }
+        };
+        logs.sort_by_key(|log| {
+            (
+                log.block_number.unwrap_or(u64::MAX),
+                log.transaction_index.unwrap_or(u64::MAX),
+                log.log_index.unwrap_or(u64::MAX),
             )
-            .await
-            {
-                Ok(logs) if !logs.is_empty() => return Ok(logs),
-                Ok(_) => found_empty = true,
-                Err(error) => {
-                    retrying_after_error = true;
-                    errors.push(format!("{}: {error:#}", endpoint.name));
+        });
+        self.verify_log_receipts(&logs, from_block, to_block)
+            .await?;
+        Ok(logs)
+    }
+
+    async fn verify_log_receipts(
+        &self,
+        logs: &[RpcLog],
+        from_block: u64,
+        to_block: u64,
+    ) -> Result<()> {
+        let mut by_transaction = HashMap::<B256, Vec<&RpcLog>>::new();
+        let mut positions = HashSet::new();
+        for log in logs {
+            let block_number = log
+                .block_number
+                .context("historical RPC log has no block number")?;
+            if !(from_block..=to_block).contains(&block_number) {
+                bail!("historical RPC log lies outside the requested canonical block range");
+            }
+            let block_hash = log
+                .block_hash
+                .context("historical RPC log has no block hash")?;
+            let transaction_hash = log
+                .transaction_hash
+                .context("historical RPC log has no transaction hash")?;
+            let transaction_index = log
+                .transaction_index
+                .context("historical RPC log has no transaction index")?;
+            let log_index = log
+                .log_index
+                .context("historical RPC log has no log index")?;
+            if log.removed || log.virtual_log {
+                bail!("historical reward log is removed or virtual rather than EVM-included");
+            }
+            if !positions.insert((block_hash, transaction_index, log_index)) {
+                bail!("historical RPC log set contains a duplicate log position");
+            }
+            by_transaction
+                .entry(transaction_hash)
+                .or_default()
+                .push(log);
+        }
+        for (hash, transaction_logs) in by_transaction {
+            let receipt = self
+                .transaction_receipt(hash)
+                .await?
+                .context("historical reward log has no matching receipt from the selected RPC")?;
+            for log in transaction_logs {
+                if receipt.block_number != log.block_number.unwrap_or_default()
+                    || receipt.block_hash != log.block_hash.unwrap_or(B256::ZERO)
+                    || receipt.transaction_index != log.transaction_index.unwrap_or_default()
+                    || !receipt.logs.contains(log)
+                {
+                    bail!(
+                        "historical reward log is not present in the matching selected-RPC receipt"
+                    );
                 }
             }
         }
-        if found_empty && errors.is_empty() {
-            return Ok(Vec::new());
-        }
-        bail!(
-            "configured RPCs could not confirm finalization logs: {}",
-            errors.join("; ")
-        )
+        Ok(())
     }
 
     pub async fn primary_nonce(&self, address: Address, block_tag: &str) -> Result<u64> {
@@ -1050,53 +1246,26 @@ impl NetworkClient {
     }
 
     pub async fn canonical_block_hash(&self, block_number: u64) -> Result<B256> {
-        let primary = self.primary_endpoint()?;
+        let endpoint = self.primary_endpoint()?;
         self.history_telemetry
             .add(HistoryCounter::CanonicalBlockRequests, 1);
         let started = Instant::now();
-        let primary_block = block_at(primary, block_number).await;
+        let result = block_at(endpoint, block_number).await;
         self.history_telemetry
             .add_elapsed(HistoryDuration::HistoricalRpc, started.elapsed());
-        let canonical = match primary_block {
-            Ok(block) => block.hash,
+        match result {
+            Ok(block) => Ok(block.hash),
             Err(error) => {
                 self.history_telemetry.add(HistoryCounter::RpcErrors, 1);
-                return Err(error);
-            }
-        };
-        for endpoint in &self.endpoints {
-            if endpoint.name == "primary" {
-                continue;
-            }
-            self.history_telemetry
-                .add(HistoryCounter::CanonicalBlockRequests, 1);
-            let started = Instant::now();
-            match block_at(endpoint, block_number).await {
-                Ok(block) if block.hash == canonical => {
-                    self.history_telemetry
-                        .add_elapsed(HistoryDuration::HistoricalRpc, started.elapsed());
-                }
-                Ok(_) => {
-                    self.history_telemetry.add(HistoryCounter::RpcErrors, 1);
-                    self.history_telemetry
-                        .add_elapsed(HistoryDuration::HistoricalRpc, started.elapsed());
-                    bail!(
-                        "RPC {} disagrees with the primary block hash at {block_number}; refusing to settle the receipt",
-                        endpoint.name
-                    );
-                }
-                Err(error) => {
-                    self.history_telemetry.add(HistoryCounter::RpcErrors, 1);
-                    self.history_telemetry
-                        .add_elapsed(HistoryDuration::HistoricalRpc, started.elapsed());
-                    self.report_diagnostic(format!(
-                        "RPC {} cannot corroborate block {block_number}: {error:#}",
-                        endpoint.name
-                    ));
-                }
+                Err(error).with_context(|| {
+                    format!("selected trusted RPC cannot read canonical block {block_number}")
+                })
             }
         }
-        Ok(canonical)
+    }
+
+    async fn financial_block_hash(&self, block_number: u64) -> Result<B256> {
+        self.canonical_block_hash(block_number).await
     }
 
     pub async fn receipt_confirmations(
@@ -1108,11 +1277,8 @@ impl NetworkClient {
         if latest_block_number < block_number {
             return Ok(Some(0));
         }
-        // Count confirmations only against a head the transaction's primary RPC can
-        // serve and that configured archival endpoints do not contradict. A faster
-        // archive must not settle receipts while the primary is still behind.
-        self.canonical_block_hash(latest_block_number).await?;
-        let canonical_hash = self.canonical_block_hash(block_number).await?;
+        self.financial_block_hash(latest_block_number).await?;
+        let canonical_hash = self.financial_block_hash(block_number).await?;
         if canonical_hash != block_hash {
             return Ok(None);
         }
@@ -1133,10 +1299,23 @@ impl NetworkClient {
         if snapshot.number < block_number {
             return Ok(Some(0));
         }
+        let snapshot_hash = if let Some(hash) = canonical_blocks.get(&snapshot.number) {
+            *hash
+        } else {
+            let hash = self.financial_block_hash(snapshot.number).await?;
+            if hash != snapshot.hash {
+                bail!("selected trusted RPC no longer agrees with the monitoring snapshot");
+            }
+            canonical_blocks.insert(snapshot.number, hash);
+            hash
+        };
+        if snapshot_hash != snapshot.hash {
+            bail!("cached snapshot hash disagrees with the current monitoring snapshot");
+        }
         let canonical_hash = if let Some(hash) = canonical_blocks.get(&block_number) {
             *hash
         } else {
-            let hash = self.canonical_block_hash(block_number).await?;
+            let hash = self.financial_block_hash(block_number).await?;
             canonical_blocks.insert(block_number, hash);
             hash
         };
@@ -1156,6 +1335,14 @@ impl NetworkClient {
             .iter()
             .find(|endpoint| endpoint.name == "primary")
             .context("configured primary RPC is unavailable; refusing to broadcast")
+    }
+
+    fn archival_endpoint(&self) -> Option<&RpcEndpoint> {
+        self.archival_endpoint.as_ref()
+    }
+
+    fn trusted_rpc_endpoints(&self) -> Result<Vec<RpcEndpoint>> {
+        Ok(vec![self.primary_endpoint()?.clone()])
     }
 
     #[cfg(test)]
@@ -1220,6 +1407,8 @@ impl NetworkClient {
         Ok(Self {
             manifest,
             endpoints: vec![endpoint],
+            archival_endpoint: None,
+            custom_primary: false,
             activation_work: Arc::new(Mutex::new(HashSet::new())),
             diagnostics: None,
             history_telemetry: Arc::new(HistoryTelemetry::default()),
@@ -1346,7 +1535,6 @@ impl NetworkClient {
             progress.complete(format!("Deployment block selected · #{}", block.number));
             progress.begin("Verifying deployment reference snapshot");
         }
-        let endpoint = &endpoints[0];
         if self.manifest.reference_snapshot.is_some() {
             self.verification.reference_snapshot_verified = self.verify_reference_snapshot().await;
             if !self.verification.reference_snapshot_verified {
@@ -1370,21 +1558,27 @@ impl NetworkClient {
             if let Some(progress) = progress {
                 progress.begin("Verifying AST token");
             }
-            match self.verify_token_pin(endpoint, block.number, token).await {
-                Ok(()) => {
-                    self.verification.token_verified = true;
-                    if let Some(progress) = progress {
-                        progress.complete("AST token verified");
-                    }
+            let mut token_errors = Vec::new();
+            for source in &endpoints {
+                if let Err(error) = self.verify_token_pin(source, block.number, token).await {
+                    token_errors.push(format!("{}: {error:#}", source.name));
                 }
-                Err(error) => {
-                    self.verification.token_verified = false;
-                    let message = format!("AST token is unverified: {error:#}");
-                    if let Some(progress) = progress {
-                        progress.warn(&message);
-                    } else {
-                        self.report_diagnostic(message);
-                    }
+            }
+            if token_errors.is_empty() {
+                self.verification.token_verified = true;
+                if let Some(progress) = progress {
+                    progress.complete("AST token verified");
+                }
+            } else {
+                self.verification.token_verified = false;
+                let message = format!(
+                    "AST token is unverified because provider checks did not all succeed: {}",
+                    token_errors.join("; ")
+                );
+                if let Some(progress) = progress {
+                    progress.warn(&message);
+                } else {
+                    self.report_diagnostic(message);
                 }
             }
         }
@@ -1400,7 +1594,9 @@ impl NetworkClient {
             }
             let mut verified = 0;
             for (index, pin) in self.manifest.nodes.clone().into_iter().enumerate() {
-                let status = self.verify_node_pin(endpoint, &block, &pin).await;
+                let status = self
+                    .verify_node_pin_for_snapshot(&endpoints, &block, &pin)
+                    .await;
                 if status.runtime_verified && status.abi_verified {
                     verified += 1;
                 } else {
@@ -1447,14 +1643,17 @@ impl NetworkClient {
         let Ok(expected_hash) = parse_hash(&snapshot.block_hash) else {
             return false;
         };
-        for endpoint in &self.endpoints {
-            if let Ok(block) = block_at(endpoint, snapshot.block_number).await
-                && block.hash == expected_hash
-            {
-                return true;
+        let endpoints = self.endpoints.clone();
+        if endpoints.is_empty() {
+            return false;
+        }
+        for endpoint in &endpoints {
+            match block_at(endpoint, snapshot.block_number).await {
+                Ok(block) if block.hash == expected_hash => {}
+                _ => return false,
             }
         }
-        false
+        true
     }
 
     async fn verify_token_pin(
@@ -1601,12 +1800,66 @@ impl NetworkClient {
         }
     }
 
+    async fn verify_node_pin_for_snapshot(
+        &self,
+        endpoints: &[RpcEndpoint],
+        block: &BlockSnapshot,
+        pin: &NodePin,
+    ) -> ContractPinStatus {
+        let mut results = Vec::with_capacity(endpoints.len());
+        for endpoint in endpoints {
+            results.push((
+                endpoint.name.clone(),
+                self.verify_node_pin(endpoint, block, pin).await,
+            ));
+        }
+        let Some((_, status)) = results.first() else {
+            return ContractPinStatus {
+                runtime_verified: false,
+                abi_verified: false,
+                error: Some("no RPC endpoint verified the deployment pin".to_owned()),
+            };
+        };
+        let failures = results
+            .iter()
+            .filter(|(_, result)| !result.runtime_verified || !result.abi_verified)
+            .map(|(name, result)| {
+                format!(
+                    "{name}: {}",
+                    result
+                        .error
+                        .as_deref()
+                        .unwrap_or("deployment pin verification failed")
+                )
+            })
+            .collect::<Vec<_>>();
+        if !failures.is_empty() {
+            self.activation_work
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&pin.id);
+            return ContractPinStatus {
+                runtime_verified: false,
+                abi_verified: false,
+                error: Some(format!(
+                    "selected RPC did not verify node {}: {}",
+                    pin.id,
+                    failures.join("; ")
+                )),
+            };
+        }
+        status.clone()
+    }
+
     pub async fn snapshot(&self, wallet: Option<Address>) -> Result<ReadSnapshot> {
         let (endpoints, block) = self.best_block().await?;
-        let endpoint = endpoints[0].clone();
+        let primary = endpoints
+            .first()
+            .cloned()
+            .context("selected primary RPC is unavailable")?;
         let mut node_jobs = JoinSet::new();
         for pin in self.manifest.nodes.clone() {
-            let endpoints = endpoints.clone();
+            let primary = primary.clone();
             let pin_status = self
                 .verification
                 .nodes
@@ -1620,7 +1873,7 @@ impl NetworkClient {
             let manifest = self.manifest.clone();
             let block = block.clone();
             node_jobs.spawn(async move {
-                fetch_node_from_endpoints(&endpoints, &manifest, pin, pin_status, block).await
+                fetch_node_from_rpc(&primary, &manifest, pin, pin_status, block).await
             });
         }
 
@@ -1636,9 +1889,35 @@ impl NetworkClient {
             .await?;
 
         let (native_balance, native_balance_error) = if let Some(address) = wallet {
-            match get_balance(&endpoint, address, block.number).await {
-                Ok(balance) => (Some(balance), None),
-                Err(error) => (None, Some(format!("{error:#}"))),
+            let mut balances = Vec::with_capacity(endpoints.len());
+            let mut errors = Vec::new();
+            for endpoint in &endpoints {
+                match get_balance(endpoint, address, block.number).await {
+                    Ok(balance) => balances.push((endpoint.name.as_str(), balance)),
+                    Err(error) => errors.push(format!("{}: {error:#}", endpoint.name)),
+                }
+            }
+            if !errors.is_empty() {
+                (
+                    None,
+                    Some(format!(
+                        "selected RPC confirmed-balance request failed: {}",
+                        errors.join("; ")
+                    )),
+                )
+            } else if balances
+                .iter()
+                .any(|(_, balance)| *balance != balances[0].1)
+            {
+                (
+                    None,
+                    Some(
+                        "selected RPC returned inconsistent confirmed INJ balance values"
+                            .to_owned(),
+                    ),
+                )
+            } else {
+                (Some(balances[0].1), None)
             }
         } else {
             (None, None)
@@ -1646,19 +1925,37 @@ impl NetworkClient {
         let (ast_balance, ast_balance_error) = match (&self.manifest.ast_token, wallet) {
             (Some(token), Some(address)) if self.verification.token_verified => {
                 let token_address = parse_address(&token.address)?;
-                match call_contract(
-                    &endpoint,
-                    token_address,
-                    IERC20Read::balanceOfCall { account: address },
-                    block.number,
-                )
-                .await
-                {
-                    Ok(value) => match decode_return::<U256>(&value) {
-                        Ok(balance) => (Some(balance), None),
-                        Err(error) => (None, Some(error.to_string())),
-                    },
-                    Err(error) => (None, Some(format!("{error:#}"))),
+                let mut balances = Vec::with_capacity(endpoints.len());
+                let mut errors = Vec::new();
+                for endpoint in &endpoints {
+                    match call_contract(
+                        endpoint,
+                        token_address,
+                        IERC20Read::balanceOfCall { account: address },
+                        block.number,
+                    )
+                    .await
+                    .and_then(|value| decode_return::<U256>(&value))
+                    {
+                        Ok(balance) => balances.push(balance),
+                        Err(error) => errors.push(format!("{}: {error:#}", endpoint.name)),
+                    }
+                }
+                if !errors.is_empty() {
+                    (
+                        None,
+                        Some(format!(
+                            "selected RPC AST-balance request failed: {}",
+                            errors.join("; ")
+                        )),
+                    )
+                } else if balances.iter().any(|balance| *balance != balances[0]) {
+                    (
+                        None,
+                        Some("selected RPC returned inconsistent AST balance values".to_owned()),
+                    )
+                } else {
+                    (Some(balances[0]), None)
                 }
             }
             (Some(_), Some(_)) => (
@@ -1756,10 +2053,12 @@ impl NetworkClient {
             let mut jobs = JoinSet::new();
             for (node_id, pin) in batch.iter().cloned() {
                 let client = self.clone();
-                let endpoint = endpoint.clone();
+                let endpoints = endpoints.to_vec();
                 let block = block.clone();
                 jobs.spawn(async move {
-                    let status = client.verify_node_pin(&endpoint, &block, &pin).await;
+                    let status = client
+                        .verify_node_pin_for_snapshot(&endpoints, &block, &pin)
+                        .await;
                     (node_id, status)
                 });
             }
@@ -1810,7 +2109,7 @@ impl NetworkClient {
             }
         }
         if matching_endpoints.is_empty() {
-            bail!("activation snapshot is no longer on a corroborated canonical chain");
+            bail!("selected RPC no longer reports the activation snapshot on its canonical chain");
         }
         self.verify_active_nodes(
             &matching_endpoints,
@@ -1822,75 +2121,50 @@ impl NetworkClient {
     }
 
     async fn best_block(&self) -> Result<(Vec<RpcEndpoint>, BlockSnapshot)> {
-        let mut candidates = Vec::new();
-        let mut errors = Vec::new();
-        let mut all_errors_transient = true;
-        for endpoint in &self.endpoints {
-            match endpoint_block(endpoint).await {
-                Ok((number, block)) => candidates.push((endpoint.clone(), number, block)),
-                Err(error) => {
-                    all_errors_transient &= is_transient_rpc_error(&error);
-                    errors.push(format!("{}: {error:#}", endpoint.name));
-                }
-            }
-        }
-        candidates.sort_by_key(|(_, number, _)| std::cmp::Reverse(*number));
-        let Some((best_endpoint, best_number, best_block)) = candidates.first().cloned() else {
-            let details = errors.join("; ");
-            if all_errors_transient {
-                return Err(anyhow::Error::new(TransientRpcFailure { details }));
-            }
-            bail!("all configured RPCs failed: {details}");
-        };
-        for (_, number, other_block) in &candidates {
-            if *number == best_number && other_block.hash != best_block.hash {
-                bail!(
-                    "RPC endpoints disagree on block {best_number}; refusing potentially forked work"
-                );
-            }
-        }
-        let mut snapshot_endpoints = Vec::with_capacity(candidates.len());
-        for (candidate, number, candidate_block) in candidates {
-            if number == best_number && candidate_block.hash == best_block.hash {
-                snapshot_endpoints.push(candidate);
-                continue;
-            }
-            match block_at(&candidate, best_number).await {
-                Ok(block) if block.hash == best_block.hash => snapshot_endpoints.push(candidate),
-                Ok(_) => self.report_diagnostic(format!(
-                    "RPC {} disagrees with snapshot block {}; excluding it for this read.",
-                    candidate.name, best_number
-                )),
-                Err(error) => self.report_diagnostic(format!(
-                    "RPC {} cannot serve snapshot block {}: {error:#}",
-                    candidate.name, best_number
-                )),
-            }
-        }
-        if snapshot_endpoints.is_empty() {
-            bail!("no RPC endpoint can serve the selected canonical snapshot block");
-        }
-        // Keep the newest endpoint first for balances and final reorg validation.
-        if let Some(index) = snapshot_endpoints
-            .iter()
-            .position(|candidate| candidate.name == best_endpoint.name)
-        {
-            snapshot_endpoints.swap(0, index);
-        }
-        Ok((snapshot_endpoints, best_block))
+        let endpoint = self.primary_endpoint()?.clone();
+        let (_, block) = endpoint_block(&endpoint)
+            .await
+            .context("read the selected trusted RPC head")?;
+        Ok((vec![endpoint], block))
     }
 }
 
-fn receipts_agree(left: &TransactionReceipt, right: &TransactionReceipt) -> bool {
-    left.transaction_hash == right.transaction_hash
-        && left.status == right.status
-        && left.gas_used == right.gas_used
-        && left.block_number == right.block_number
-        && left.block_hash == right.block_hash
-        && (left.effective_gas_price.is_none()
-            || right.effective_gas_price.is_none()
-            || left.effective_gas_price == right.effective_gas_price)
-        && left.logs == right.logs
+fn validate_trusted_rpc_receipt(receipt: &TransactionReceipt) -> Result<()> {
+    if receipt.from.is_zero() || receipt.to.is_none() {
+        bail!("receipt does not describe a signed contract transaction");
+    }
+    if receipt.block_hash.is_zero() || receipt.block_number == 0 {
+        bail!("receipt has no valid block association");
+    }
+    if receipt.gas_used.is_zero() {
+        bail!("receipt reports zero gas for a fee-paying EVM transaction");
+    }
+    if receipt.cumulative_gas_used < receipt.gas_used {
+        bail!("receipt cumulative gas is lower than its gas usage");
+    }
+    if receipt
+        .effective_gas_price
+        .is_some_and(|price| price.is_zero())
+    {
+        bail!("receipt reports a zero effective gas price");
+    }
+    if !receipt.status && !receipt.logs.is_empty() {
+        bail!("reverted EVM receipt unexpectedly contains logs");
+    }
+    for log in &receipt.logs {
+        if log.removed || log.virtual_log {
+            bail!("transaction receipt contains a removed or virtual log");
+        }
+        if log.block_number != Some(receipt.block_number)
+            || log.block_hash != Some(receipt.block_hash)
+            || log.transaction_hash != Some(receipt.transaction_hash)
+            || log.transaction_index != Some(receipt.transaction_index)
+            || log.log_index.is_none()
+        {
+            bail!("receipt log metadata does not match its enclosing transaction receipt");
+        }
+    }
+    Ok(())
 }
 
 fn parse_rpc_log(log: ReceiptLogJson) -> Result<RpcLog> {
@@ -1913,6 +2187,23 @@ fn parse_rpc_log(log: ReceiptLogJson) -> Result<RpcLog> {
             .map(parse_hex_quantity)
             .transpose()?,
         block_hash: log.block_hash.as_deref().map(parse_hash).transpose()?,
+        transaction_hash: log
+            .transaction_hash
+            .as_deref()
+            .map(parse_hash)
+            .transpose()?,
+        transaction_index: log
+            .transaction_index
+            .as_deref()
+            .map(parse_hex_quantity)
+            .transpose()?,
+        log_index: log
+            .log_index
+            .as_deref()
+            .map(parse_hex_quantity)
+            .transpose()?,
+        removed: log.removed,
+        virtual_log: log.virtual_log,
     })
 }
 
@@ -2003,10 +2294,7 @@ async fn window_finalization_logs_range_at(
 }
 
 async fn connect_endpoint(name: &str, url: &str) -> Result<RpcEndpoint> {
-    let url = Url::parse(url).context("parse RPC endpoint URL")?;
-    if url.scheme() != "https" {
-        bail!("refusing non-HTTPS RPC endpoint");
-    }
+    let url = validate_rpc_url(url).context("validate RPC endpoint URL")?;
     let client = reqwest::Client::builder()
         .timeout(RPC_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
@@ -2221,9 +2509,19 @@ async fn rpc_request<T: DeserializeOwned>(
         }))
         .send()
         .await
-        .with_context(|| format!("send {method} JSON-RPC request to {}", endpoint.name))?
+        .map_err(|error| {
+            anyhow::Error::new(error.without_url()).context(format!(
+                "send {method} JSON-RPC request to {}",
+                endpoint.name
+            ))
+        })?
         .error_for_status()
-        .with_context(|| format!("{method} returned an HTTP error from {}", endpoint.name))?;
+        .map_err(|error| {
+            anyhow::Error::new(error.without_url()).context(format!(
+                "{method} returned an HTTP error from {}",
+                endpoint.name
+            ))
+        })?;
     if response
         .content_length()
         .is_some_and(|length| length > MAX_RPC_RESPONSE_BYTES as u64)
@@ -2234,11 +2532,12 @@ async fn rpc_request<T: DeserializeOwned>(
         );
     }
     let mut body = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .with_context(|| format!("read {method} JSON-RPC response from {}", endpoint.name))?
-    {
+    while let Some(chunk) = response.chunk().await.map_err(|error| {
+        anyhow::Error::new(error.without_url()).context(format!(
+            "read {method} JSON-RPC response from {}",
+            endpoint.name
+        ))
+    })? {
         if body.len().saturating_add(chunk.len()) > MAX_RPC_RESPONSE_BYTES {
             bail!(
                 "{method} response from {} exceeds the 2 MiB limit",
@@ -2252,13 +2551,25 @@ async fn rpc_request<T: DeserializeOwned>(
     if let Some(error) = response.error {
         return Err(anyhow::Error::new(RpcServerError {
             code: error.code,
-            message: error.message,
+            message: redact_rpc_message(endpoint, &error.message),
         }))
         .with_context(|| format!("{method} JSON-RPC request to {}", endpoint.name));
     }
     response
         .result()
         .with_context(|| format!("{method} JSON-RPC response has no result"))
+}
+
+fn redact_rpc_message(endpoint: &RpcEndpoint, message: &str) -> String {
+    let mut redacted = message.replace(endpoint.url.as_str(), "<rpc-url>");
+    if let Some(query) = endpoint.url.query().filter(|query| !query.is_empty()) {
+        redacted = redacted.replace(query, "<redacted-query>");
+    }
+    let path = endpoint.url.path();
+    if path != "/" {
+        redacted = redacted.replace(path, "/<redacted-path>");
+    }
+    redacted
 }
 
 async fn get_code(endpoint: &RpcEndpoint, address: Address, block: u64) -> Result<Bytes> {
@@ -2286,8 +2597,8 @@ async fn get_balance(endpoint: &RpcEndpoint, address: Address, block: u64) -> Re
     parse_hex_u256(&result)
 }
 
-async fn fetch_node_from_endpoints(
-    endpoints: &[RpcEndpoint],
+async fn fetch_node_from_rpc(
+    endpoint: &RpcEndpoint,
     manifest: &DeploymentManifest,
     pin: NodePin,
     pin_status: ContractPinStatus,
@@ -2311,27 +2622,24 @@ async fn fetch_node_from_endpoints(
         );
     }
 
-    let mut last_error = None;
-    for endpoint in endpoints {
-        match fetch_node(endpoint, manifest, address, &block).await {
-            Ok(state) => {
-                return NodeView {
-                    id: pin.id,
-                    address,
-                    pin: pin_status,
-                    state: Some(state),
-                    error: None,
-                };
-            }
-            Err(error) => last_error = Some(format!("{}: {error:#}", endpoint.name)),
+    let state = match fetch_node(endpoint, manifest, address, &block).await {
+        Ok(state) => state,
+        Err(error) => {
+            return NodeView::unavailable(
+                pin.id,
+                address,
+                pin_status,
+                format!("selected RPC could not verify node state: {error:#}"),
+            );
         }
-    }
-    NodeView::unavailable(
-        pin.id,
+    };
+    NodeView {
+        id: pin.id,
         address,
-        pin_status,
-        last_error.unwrap_or_else(|| "no verified RPC endpoint".to_owned()),
-    )
+        pin: pin_status,
+        state: Some(state),
+        error: None,
+    }
 }
 
 impl NodeView {
@@ -2605,9 +2913,10 @@ fn parse_hex_u256(value: &str) -> Result<U256> {
 #[cfg(test)]
 mod tests {
     use super::{
-        NetworkClient, RpcEndpoint, RpcResponse, RpcResult, SUBMISSION_FEE_WEI, decode_candidate,
-        decode_mining, decode_work, is_transient_receipt_error, is_transient_rpc_error,
-        is_window_expired_revert, is_window_not_expired_revert, rpc_request,
+        MiningInfo, NetworkClient, RpcEndpoint, RpcResponse, RpcResult, SUBMISSION_FEE_WEI,
+        WorkInfo, decode_candidate, decode_mining, decode_work, is_transient_receipt_error,
+        is_transient_rpc_error, is_window_expired_revert, is_window_not_expired_revert,
+        rpc_request, validate_coherent_state, validate_trusted_rpc_receipt,
     };
     use crate::deployment::NodePin;
     use alloy_primitives::{Address, B256, Bytes, U256, hex};
@@ -2649,6 +2958,20 @@ mod tests {
                 .unwrap(),
         };
         (endpoint, server)
+    }
+
+    fn unreachable_endpoint(name: &str) -> RpcEndpoint {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        RpcEndpoint {
+            name: name.to_owned(),
+            url: Url::parse(&format!("http://{address}")).unwrap(),
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(1))
+                .build()
+                .unwrap(),
+        }
     }
 
     #[tokio::test]
@@ -2713,13 +3036,169 @@ mod tests {
     fn receipt_result(hash: B256, block_hash: B256) -> String {
         rpc_result(serde_json::json!({
             "transactionHash": format!("{hash:#x}"),
+            "transactionIndex": "0x0",
+            "from": format!("{:#x}", Address::with_last_byte(0x11)),
+            "to": format!("{:#x}", Address::with_last_byte(0x22)),
             "status": "0x1",
             "gasUsed": "0x5208",
+            "cumulativeGasUsed": "0x5208",
             "effectiveGasPrice": "0x2",
+            "type": "0x2",
             "blockNumber": "0x10",
             "blockHash": format!("{block_hash:#x}"),
             "logs": [],
         }))
+    }
+
+    fn transaction_result(hash: B256) -> String {
+        rpc_result(serde_json::json!({
+            "hash": format!("{hash:#x}"),
+            "chainId": "0x59f",
+            "from": format!("{:#x}", Address::with_last_byte(0x11)),
+            "to": format!("{:#x}", Address::with_last_byte(0x22)),
+            "nonce": "0x0",
+            "value": "0x0",
+            "gas": "0x5208",
+            "input": "0x",
+            "gasPrice": "0x2",
+            "maxFeePerGas": "0x2",
+            "maxPriorityFeePerGas": "0x1",
+            "type": "0x2",
+        }))
+    }
+
+    #[tokio::test]
+    async fn transaction_details_decode_signed_intent_fields_from_rpc() {
+        let hash = B256::with_last_byte(0x91);
+        let (endpoint, server) = mock_endpoint("primary", vec![(200, transaction_result(hash))]);
+        let client = network_client(vec![endpoint]);
+
+        let transaction = client.transaction_details(hash).await.unwrap().unwrap();
+        assert_eq!(transaction.hash, hash);
+        assert_eq!(transaction.chain_id, Some(1439));
+        assert_eq!(transaction.from, Address::with_last_byte(0x11));
+        assert_eq!(transaction.to, Some(Address::with_last_byte(0x22)));
+        assert_eq!(transaction.nonce, 0);
+        assert_eq!(transaction.value, U256::ZERO);
+        assert_eq!(transaction.gas_limit, 21_000);
+        assert!(transaction.input.is_empty());
+        assert_eq!(transaction.gas_price, Some(U256::from(2)));
+        assert_eq!(transaction.max_fee_per_gas, Some(U256::from(2)));
+        assert_eq!(transaction.max_priority_fee_per_gas, Some(U256::from(1)));
+        assert_eq!(transaction.transaction_type, Some(2));
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn custom_rpc_validation_requires_the_selected_network_chain_id() {
+        let (endpoint, server) = mock_endpoint(
+            "custom",
+            vec![(200, rpc_result(serde_json::json!("0x59f")))],
+        );
+        let url = endpoint.url.to_string();
+        NetworkClient::validate_rpc_endpoint(crate::cli::Network::Testnet, &url)
+            .await
+            .unwrap();
+        server.join().unwrap();
+
+        let (endpoint, server) = mock_endpoint(
+            "wrong-chain",
+            vec![(200, rpc_result(serde_json::json!("0x6f0")))],
+        );
+        let url = endpoint.url.to_string();
+        let error = NetworkClient::validate_rpc_endpoint(crate::cli::Network::Testnet, &url)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("expected 1439"));
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn custom_primary_with_wrong_chain_is_rejected_without_fallback() {
+        let (endpoint, server) = mock_endpoint(
+            "custom",
+            vec![(200, rpc_result(serde_json::json!("0x6f0")))],
+        );
+        let url = endpoint.url.to_string();
+        let error = NetworkClient::connect_with_rpc(crate::cli::Network::Testnet, Some(&url))
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("expected 1439"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn node_work_and_mining_state_must_match_at_selected_block() {
+        let work = WorkInfo {
+            started: true,
+            ended: false,
+            window_id: 7,
+            window_start_time: 100,
+            window_expiry_time: 160,
+            seed: B256::with_last_byte(1),
+            prev_hash: B256::with_last_byte(2),
+            target: U256::MAX,
+            reward_per_window: U256::from(3),
+            remaining_allocation: U256::from(4),
+            max_header_length: 64,
+            submission_fee: U256::from(SUBMISSION_FEE_WEI),
+        };
+        let mining = MiningInfo {
+            started: true,
+            ended: false,
+            window_id: 7,
+            reward_per_window: U256::from(3),
+            target: U256::MAX,
+            seed: B256::with_last_byte(1),
+            prev_hash: B256::with_last_byte(2),
+        };
+        assert!(validate_coherent_state(&work, &mining).is_ok());
+
+        let mut inconsistent = mining;
+        inconsistent.target = U256::from(1);
+        let error = validate_coherent_state(&work, &inconsistent).unwrap_err();
+        assert!(format!("{error:#}").contains("work() and miningState() disagree"));
+    }
+
+    #[test]
+    fn trusted_rpc_receipt_rejects_logs_not_bound_to_its_inclusion_metadata() {
+        let hash = B256::with_last_byte(0x91);
+        let block_hash = B256::with_last_byte(0x92);
+        let log = super::RpcLog {
+            address: Address::with_last_byte(0x93),
+            topics: Vec::new(),
+            data: Bytes::new(),
+            block_number: Some(10),
+            block_hash: Some(block_hash),
+            transaction_hash: Some(hash),
+            transaction_index: Some(2),
+            log_index: Some(7),
+            removed: false,
+            virtual_log: false,
+        };
+        let receipt = super::TransactionReceipt {
+            transaction_hash: hash,
+            transaction_index: 2,
+            from: Address::with_last_byte(0x94),
+            to: Some(Address::with_last_byte(0x95)),
+            status: true,
+            gas_used: U256::from(21_000),
+            cumulative_gas_used: U256::from(42_000),
+            effective_gas_price: Some(U256::from(1)),
+            transaction_type: Some(2),
+            block_number: 10,
+            block_hash,
+            logs: vec![log],
+        };
+        assert!(validate_trusted_rpc_receipt(&receipt).is_ok());
+
+        let mut forged = receipt.clone();
+        forged.logs[0].transaction_hash = Some(B256::with_last_byte(0x96));
+        assert!(validate_trusted_rpc_receipt(&forged).is_err());
+
+        let mut virtual_event = receipt;
+        virtual_event.logs[0].virtual_log = true;
+        assert!(validate_trusted_rpc_receipt(&virtual_event).is_err());
     }
 
     fn block_result(number: u64, timestamp: u64, hash: B256) -> String {
@@ -2776,8 +3255,37 @@ mod tests {
             9,
         )
         .unwrap();
-        client.endpoints = endpoints;
+        client.archival_endpoint = endpoints
+            .iter()
+            .find(|endpoint| endpoint.name == "archival")
+            .cloned();
+        client.endpoints = vec![
+            endpoints
+                .into_iter()
+                .find(|endpoint| endpoint.name == "primary")
+                .unwrap(),
+        ];
         client
+    }
+
+    #[tokio::test]
+    async fn trusted_snapshot_uses_only_the_selected_primary_rpc() {
+        let block_hash = B256::with_last_byte(0x31);
+        let (primary, primary_server) = mock_endpoint(
+            "primary",
+            vec![
+                (200, rpc_result(serde_json::json!("0x10"))),
+                (200, block_result(16, 100, block_hash)),
+            ],
+        );
+        let archival = unreachable_endpoint("archival");
+        let client = network_client(vec![primary, archival]);
+
+        let (endpoints, block) = client.best_block().await.unwrap();
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0].name, "primary");
+        assert_eq!(block.hash, block_hash);
+        primary_server.join().unwrap();
     }
 
     #[tokio::test]
@@ -2885,6 +3393,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn custom_primary_receipt_lookup_never_substitutes_the_archival_endpoint() {
+        let hash = B256::with_last_byte(0x62);
+        let (primary, primary_server) =
+            mock_endpoint("primary", vec![(200, rpc_result(serde_json::Value::Null))]);
+        let archival = unreachable_endpoint("archival");
+        let mut client = network_client(vec![primary, archival]);
+        client.custom_primary = true;
+
+        assert!(client.transaction_receipt(hash).await.unwrap().is_none());
+        primary_server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn custom_primary_historical_reads_do_not_silently_fall_back_to_archival() {
+        let (primary, primary_server) = mock_endpoint("primary", vec![(503, "{}".to_owned())]);
+        let archival = unreachable_endpoint("archival");
+        let mut client = network_client(vec![primary, archival]);
+        client.custom_primary = true;
+
+        let error = client
+            .window_finalization_logs_range(
+                Address::with_last_byte(1),
+                Address::with_last_byte(2),
+                0,
+                10,
+                10,
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("selected custom RPC"));
+        primary_server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn transaction_lookup_follows_the_selected_primary_rpc() {
+        let hash = B256::with_last_byte(0x63);
+        let transaction = transaction_result(hash);
+        let (primary, primary_server) = mock_endpoint(
+            "primary",
+            vec![
+                (200, rpc_result(serde_json::Value::Null)),
+                (200, transaction.clone()),
+            ],
+        );
+        let archival = unreachable_endpoint("archival");
+        let client = network_client(vec![primary, archival]);
+
+        assert!(client.transaction_details(hash).await.unwrap().is_none());
+        assert_eq!(
+            client
+                .transaction_details(hash)
+                .await
+                .unwrap()
+                .unwrap()
+                .hash,
+            hash
+        );
+        primary_server.join().unwrap();
+    }
+
+    #[tokio::test]
     async fn absent_result_is_an_error_and_json_rpc_errors_are_preserved() {
         let (endpoint, server) = mock_endpoint(
             "primary",
@@ -2921,23 +3490,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_pending_null_with_a_transient_peer_error_remains_retryable() {
-        let (primary, primary_server) =
-            mock_endpoint("primary", vec![(200, rpc_result(serde_json::Value::Null))]);
-        let (archival, archival_server) = mock_endpoint("archival", vec![(503, "{}".to_owned())]);
-        let client = network_client(vec![primary, archival]);
-
-        let error = client
-            .transaction_receipt(B256::with_last_byte(0x91))
-            .await
-            .unwrap_err();
-        assert!(is_transient_receipt_error(&error));
-        assert!(format!("{error:#}").contains("returned pending"));
-        primary_server.join().unwrap();
-        archival_server.join().unwrap();
-    }
-
-    #[tokio::test]
     async fn all_transient_receipt_endpoint_errors_are_retryable() {
         let (primary, primary_server) = mock_endpoint("primary", vec![(503, "{}".to_owned())]);
         let client = network_client(vec![primary]);
@@ -2947,7 +3499,10 @@ mod tests {
             .unwrap_err();
 
         assert!(is_transient_receipt_error(&error));
-        assert!(format!("{error:#}").contains("read transaction receipt"));
+        assert!(
+            format!("{error:#}")
+                .contains("selected RPC receipt request is temporarily unavailable")
+        );
         primary_server.join().unwrap();
     }
 
@@ -3018,23 +3573,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inconsistent_receipt_endpoints_are_rejected() {
+    async fn receipt_content_from_the_selected_primary_is_used_as_trusted_input() {
         let hash = B256::with_last_byte(0xb1);
         let (primary, primary_server) = mock_endpoint(
             "primary",
             vec![(200, receipt_result(hash, B256::with_last_byte(0xb2)))],
         );
-        let (archival, archival_server) = mock_endpoint(
-            "archival",
-            vec![(200, receipt_result(hash, B256::with_last_byte(0xb3)))],
-        );
+        let archival = unreachable_endpoint("archival");
         let client = network_client(vec![primary, archival]);
-        let error = client.transaction_receipt(hash).await.unwrap_err();
+        let receipt = client.transaction_receipt(hash).await.unwrap().unwrap();
 
-        assert!(format!("{error:#}").contains("disagree on transaction receipt"));
-        assert!(!is_transient_receipt_error(&error));
+        assert_eq!(receipt.block_hash, B256::with_last_byte(0xb2));
         primary_server.join().unwrap();
-        archival_server.join().unwrap();
     }
 
     #[test]

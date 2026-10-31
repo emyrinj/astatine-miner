@@ -15,16 +15,14 @@ use std::{
     time::Duration,
 };
 
-const REPOSITORY: &str = "emyrinj/astatine-miner";
+const REPOSITORY: &str = env!("ASTATINE_RELEASE_REPOSITORY");
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_RELEASE_LIST_BYTES: usize = 4 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: usize = 2 * 1024 * 1024;
 const MAX_ASSET_BYTES: usize = 128 * 1024 * 1024;
 const SIGNATURE_BYTES: usize = 384;
-const RELEASES_API: &str =
-    "https://api.github.com/repos/emyrinj/astatine-miner/releases?per_page=50";
 
-const RSA_MODULUS_BASE64: &str = "vFRqlV94vTfLogc01RAkRPzmEYGO62akKkOLpBtaBqemy4gjOpDZAjSWn2wsPilPAvGQT2UWvck56GlUbv7vRzz17AvPf7cwKv+hYGCQA/5WEmhxhgLUSei44ihW5AAFC068U8iD37CwMEPDy23u4jl35HKwvEd5xasdaz8db8cX/9pquUdOL3mGnPpTXkzZqQHnkEEA42jKo8jKpl0IDTlVoKZ8Kdw6BBnzGLhizJtZGiDj5J3hH5YHrT5weh8RBDnqKSj8xNiGhgsDh5xVTUsttFfjlOFHrCHrkED3+UG01xJ5PYFyos4QSO7feLkbjlpOfh1x8pMlQ96YXIZ3mxNDltLgXqJ98/IzVvp/ewLmIkGY6pW5Exlvdbz6nfgtcbaiXCi9MwbevAojzLJ1V/wps7F/hyuv9dKSRIoaRIHkgSnA6YP8epTnJn+swL9LHdZjayS1vkXf8s46IAaLyh8ts3pJY8Tb5gAIzJ6OvDxijD1AnnhrMEew9lcVVW6H";
+const RSA_MODULUS_BASE64: &str = "1Qxetx4KvnfuhGEP17i09JKEg2WYQ5ExtGc8ioSsVi4zsghLCaDL2WKs0ibGyTa2Gju2x0UTGHRuUBHEaDtaAs4oirYtVwwvj5Jca14zc2ggL1ZcwBiN+B3GvTwOot+kd/QBcp+yFiGj2YdUtt9PZcIweIi0LZnbJGyl+khfWQ3iHa+1bpCzin5KLGcPFD2UevErRx/WbKJzg2qdxkGKESDLQc9panAqZTbEkYzKQhrIJBJPBuOGJZc+K+KzeLd+iLNx31UUUaRcUtJ0g3NOgIA8z3EVM6dRnbVmT1Wk5UV5RFNAujfb7ptVx7q3fzxkV7d5Fuk0VFlSU4WddWyNsGHFpZj/U/n3yh0vRzyt08yLVsYRKpKqKFvZSN/Ad4ARYto7POee4Alu6kWHALdqIwWqR9TT5IYyiCze37ZwZcU3Mqq1t6VytWdP9GMHlWVw87v7/BglcSgb+h7e7+YN9ok5BTW/eZYqd5B1/xljaiUUHanhzQ6dX2vPnCwF5jz7";
 const RSA_EXPONENT_BASE64: &str = "AQAB";
 
 const TARGETS: [&str; 5] = [
@@ -189,8 +187,9 @@ pub async fn check_for_update() -> Result<Option<String>> {
 async fn latest_signed_update() -> Result<Option<(String, UpdateManifest)>> {
     let current = Version::parse(CURRENT_VERSION).context("parse the compiled Astatine version")?;
     let client = http_client()?;
+    let releases_api = format!("https://api.github.com/repos/{REPOSITORY}/releases?per_page=50");
     let response = client
-        .get(RELEASES_API)
+        .get(&releases_api)
         .header(reqwest::header::ACCEPT, "application/vnd.github+json")
         .send()
         .await
@@ -323,15 +322,69 @@ fn latest_testnet_release(
         .filter(|release| release.prerelease && !release.draft)
         .filter_map(|release| {
             let version = release.tag_name.strip_prefix('v')?;
-            let parsed = Version::parse(version).ok()?;
+            let parsed = parse_supported_testnet_version(version).ok()?;
             let current_base_matches = parsed.major == current.major
                 && parsed.minor == current.minor
                 && parsed.patch == current.patch;
-            let testnet_channel = parsed.pre.as_str().starts_with("testnet.");
-            (current_base_matches && testnet_channel && parsed > *current)
-                .then_some((parsed, release.tag_name))
+            (current_base_matches && parsed > *current).then_some((parsed, release.tag_name))
         })
         .max_by(|(left, _), (right, _)| left.cmp(right))
+}
+
+const MAX_SUPPORTED_VERSION_COMPONENT: u64 = i32::MAX as u64;
+
+fn parse_supported_testnet_version(text: &str) -> Result<Version> {
+    let version = Version::parse(text).context("Astatine version is not valid SemVer")?;
+    if version.major > MAX_SUPPORTED_VERSION_COMPONENT
+        || version.minor > MAX_SUPPORTED_VERSION_COMPONENT
+        || version.patch > MAX_SUPPORTED_VERSION_COMPONENT
+        || !version.build.is_empty()
+    {
+        bail!("Astatine version is outside the supported numeric SemVer range");
+    }
+    let identifiers = version.pre.as_str().split('.').collect::<Vec<_>>();
+    if identifiers.len() != 2 || identifiers[0] != "testnet" {
+        bail!("Astatine prerelease identifier must be exactly testnet.N");
+    }
+    let sequence = identifiers[1];
+    if sequence.is_empty()
+        || !sequence.bytes().all(|byte| byte.is_ascii_digit())
+        || (sequence.len() > 1 && sequence.starts_with('0'))
+    {
+        bail!("Astatine Testnet prerelease sequence must be a canonical integer");
+    }
+    let sequence = sequence
+        .parse::<u64>()
+        .context("Astatine Testnet prerelease sequence is outside the supported range")?;
+    if sequence > MAX_SUPPORTED_VERSION_COMPONENT {
+        bail!("Astatine Testnet prerelease sequence is outside the supported range");
+    }
+    Ok(version)
+}
+
+fn parse_executable_version_output(output: &str) -> Result<Version> {
+    let line = output
+        .strip_suffix("\r\n")
+        .or_else(|| output.strip_suffix('\n'))
+        .unwrap_or(output);
+    if line.contains('\n') || line.contains('\r') {
+        bail!("executable --version output must contain exactly one version line");
+    }
+    let version = line
+        .strip_prefix("astatine ")
+        .context("executable --version output must begin with `astatine `")?;
+    parse_supported_testnet_version(version)
+        .context("executable --version output is malformed or unsupported")
+}
+
+fn verify_executable_version_output(output: &str, expected_version: &str) -> Result<()> {
+    let actual = parse_executable_version_output(output)?;
+    let expected = parse_supported_testnet_version(expected_version)
+        .context("signed manifest contains an unsupported Testnet version")?;
+    if actual != expected {
+        bail!("executable --version output does not match the signed version exactly");
+    }
+    Ok(())
 }
 
 fn verify_manifest_signature(manifest: &[u8], signature: &[u8]) -> Result<()> {
@@ -383,10 +436,8 @@ fn parse_manifest(bytes: &[u8]) -> Result<UpdateManifest> {
     let version = fields
         .remove("version")
         .context("release manifest has no version")?;
-    let parsed_version = Version::parse(&version).context("release manifest version is invalid")?;
-    if !parsed_version.pre.as_str().starts_with("testnet.") {
-        bail!("release manifest version is outside the Testnet prerelease channel");
-    }
+    parse_supported_testnet_version(&version)
+        .context("release manifest version is invalid or outside the Testnet channel")?;
 
     let mut assets = BTreeMap::new();
     for (key, value) in fields {
@@ -431,6 +482,8 @@ fn validate_manifest(manifest: &UpdateManifest, tag: &str) -> Result<()> {
     if manifest.version != expected_version {
         bail!("signed release manifest version does not match its tag");
     }
+    parse_supported_testnet_version(&manifest.version)
+        .context("signed release manifest version is not a supported Testnet SemVer")?;
     let mut expected_keys = BTreeSet::new();
     for target in TARGETS {
         let binary_key = format!("binary.{target}");
@@ -683,10 +736,8 @@ fn smoke_test_binary(path: &Path, expected_version: &str) -> Result<()> {
         bail!("authenticated update failed its --version smoke test");
     }
     let version_output = String::from_utf8_lossy(&output.stdout);
-    if !version_output.contains(expected_version) {
-        bail!("authenticated update reported a different version than its manifest");
-    }
-    Ok(())
+    verify_executable_version_output(&version_output, expected_version)
+        .context("authenticated update reported a malformed or mismatched version")
 }
 
 #[cfg(unix)]
@@ -831,12 +882,14 @@ fn verify_signature_with_key(n: &[u8], e: &[u8], message: &[u8], signature: &[u8
 
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
-    use super::stage_replacement;
     use super::{
-        GitHubRelease, ManifestAsset, UpdateLock, latest_testnet_release, parse_manifest,
-        validate_manifest, verify_asset_bytes, verify_signature_with_key,
+        GitHubRelease, ManifestAsset, REPOSITORY, UpdateLock, latest_testnet_release,
+        parse_executable_version_output, parse_manifest, parse_supported_testnet_version,
+        validate_manifest, verify_asset_bytes, verify_executable_version_output,
+        verify_signature_with_key,
     };
+    #[cfg(unix)]
+    use super::{smoke_test_binary, stage_replacement};
     use base64::{Engine, engine::general_purpose::STANDARD};
     use sha2::Digest;
     use std::collections::BTreeMap;
@@ -891,8 +944,8 @@ mod tests {
     }
 
     fn manifest_text() -> String {
-        let mut text = String::from(
-            "astatine-update-manifest-v1\nrepository=emyrinj/astatine-miner\nchannel=testnet\nversion=0.1.0-testnet.9\n",
+        let mut text = format!(
+            "astatine-update-manifest-v1\nrepository={REPOSITORY}\nchannel=testnet\nversion=0.1.0-testnet.9\n"
         );
         for (key, asset) in manifest_assets() {
             text.push_str(&format!(
@@ -920,6 +973,19 @@ mod tests {
         let mut bad = manifest_text();
         bad = bad.replace("channel=testnet", "channel=mainnet");
         assert!(parse_manifest(bad.as_bytes()).is_err());
+
+        let bad_versions = [
+            "0.1.0-testnet.foo",
+            "0.1.0-testnet.13.extra",
+            "0.1.0-testnet.013",
+            "0.1.0+build.1",
+            "2147483648.0.0-testnet.1",
+            "0.1.0-testnet.2147483648",
+        ];
+        for version in bad_versions {
+            let bad = manifest_text().replace("0.1.0-testnet.9", version);
+            assert!(parse_manifest(bad.as_bytes()).is_err(), "{version}");
+        }
     }
 
     #[test]
@@ -938,7 +1004,7 @@ mod tests {
 
     #[test]
     fn selects_highest_compatible_numeric_testnet_prerelease() {
-        let current = semver::Version::parse("0.1.0-testnet.11").unwrap();
+        let current = semver::Version::parse("0.1.0-testnet.12").unwrap();
         let releases = vec![
             GitHubRelease {
                 tag_name: "v0.1.0-testnet.8".to_owned(),
@@ -961,6 +1027,11 @@ mod tests {
                 draft: false,
             },
             GitHubRelease {
+                tag_name: "v0.1.0-testnet.13".to_owned(),
+                prerelease: true,
+                draft: false,
+            },
+            GitHubRelease {
                 tag_name: "v0.2.0-testnet.10".to_owned(),
                 prerelease: true,
                 draft: false,
@@ -974,10 +1045,109 @@ mod tests {
         assert_eq!(
             latest_testnet_release(releases, &current),
             Some((
-                semver::Version::parse("0.1.0-testnet.12").unwrap(),
-                "v0.1.0-testnet.12".to_owned(),
+                semver::Version::parse("0.1.0-testnet.13").unwrap(),
+                "v0.1.0-testnet.13".to_owned(),
             ))
         );
+    }
+
+    #[test]
+    fn rust_updater_only_selects_canonical_numeric_testnet_versions() {
+        let current = semver::Version::parse("0.1.0-testnet.13").unwrap();
+        let releases = [
+            ("v0.1.0-testnet.13", true),
+            ("v0.1.0-testnet.130", true),
+            ("v0.1.0-testnet.foo", true),
+            ("v0.1.0-testnet.13.extra", true),
+            ("v0.1.0-testnet.013", true),
+            ("v0.1.0+build.1", true),
+            ("v0.1.1-testnet.1", false),
+        ]
+        .into_iter()
+        .map(|(tag_name, prerelease)| GitHubRelease {
+            tag_name: tag_name.to_owned(),
+            prerelease,
+            draft: false,
+        })
+        .collect();
+        assert_eq!(
+            latest_testnet_release(releases, &current),
+            Some((
+                semver::Version::parse("0.1.0-testnet.130").unwrap(),
+                "v0.1.0-testnet.130".to_owned()
+            ))
+        );
+        for invalid in [
+            "0.1.0-testnet.foo",
+            "0.1.0-testnet.13.extra",
+            "0.1.0-testnet.013",
+        ] {
+            assert!(
+                parse_supported_testnet_version(invalid).is_err(),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn executable_version_output_must_be_one_exact_supported_version() {
+        let expected = semver::Version::parse("0.1.0-testnet.13").unwrap();
+        for output in [
+            "astatine 0.1.0-testnet.13\n",
+            "astatine 0.1.0-testnet.13\r\n",
+        ] {
+            assert_eq!(parse_executable_version_output(output).unwrap(), expected);
+            assert!(verify_executable_version_output(output, "0.1.0-testnet.13").is_ok());
+        }
+        for output in [
+            "astatine 0.1.0-testnet.130\n",
+            "astatine 0.1.0-testnet.12\n",
+        ] {
+            assert!(parse_executable_version_output(output).is_ok());
+            assert!(
+                verify_executable_version_output(output, "0.1.0-testnet.13").is_err(),
+                "{output:?} must not match .13"
+            );
+        }
+        for output in [
+            "0.1.0-testnet.13\n",
+            "astatine 0.1.0-testnet.foo\n",
+            "astatine 0.1.0-testnet.13 \n",
+            "astatine 0.1.0-testnet.13\nextra output\n",
+            "astatine 0.1.0-testnet.13\n\n",
+            "not an Astatine version\n",
+        ] {
+            assert!(
+                parse_executable_version_output(output).is_err(),
+                "{output:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_binary_smoke_rejects_substrings_malformed_output_and_extra_lines() {
+        use std::{fs, os::unix::fs::PermissionsExt};
+        use tempfile::tempdir;
+
+        let directory = tempdir().unwrap();
+        let executable = directory.path().join("astatine");
+        for (output, expected_to_pass) in [
+            ("astatine 0.1.0-testnet.13\n", true),
+            ("astatine 0.1.0-testnet.130\n", false),
+            ("astatine 0.1.0-testnet.foo\n", false),
+            ("astatine 0.1.0-testnet.12\n", false),
+            ("astatine 0.1.0-testnet.13\nextra output\n", false),
+            ("malformed version output\n", false),
+        ] {
+            fs::write(&executable, format!("#!/bin/sh\nprintf '%s' '{output}'\n")).unwrap();
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+            assert_eq!(
+                smoke_test_binary(&executable, "0.1.0-testnet.13").is_ok(),
+                expected_to_pass,
+                "version output: {output:?}"
+            );
+        }
     }
 
     #[test]

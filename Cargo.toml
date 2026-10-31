@@ -1,6 +1,6 @@
 [package]
 name = "astatine-cli-rust"
-version = "0.1.0-testnet.12"
+version = "0.1.0-testnet.13"
 edition = "2024"
 rust-version = "1.94.1"
 description = "A native Rust CPU and GPU command-line miner for Astatine"

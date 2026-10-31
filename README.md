@@ -6,20 +6,20 @@ The protocol has nine independent mining nodes, each with its own work and windo
 
 ## Install
 
-Testnet.12 installers verify the signed release manifest and the platform archive digest before installation. No root or administrator access is required. The installer replaces only the executable and license notices; configuration, wallets, and transaction journals are left untouched. The manifest is signed with the RSA release key pinned in the client and installer scripts.
+Testnet.13 candidate installers verify the signed release manifest and the platform archive digest before installation. No root or administrator access is required. The installer replaces only the executable and license notices; configuration, wallets, and transaction journals are left untouched. The manifest is signed with the RSA release key pinned in the client and installer scripts.
 
 ### macOS and Linux
 
 Requires `curl`, `openssl`, `tar`, and `install`. Supported targets are Apple Silicon and Intel macOS, plus x86_64 and aarch64 Linux (glibc 2.35 or later).
 
 ```sh
-curl --fail --show-error --location https://raw.githubusercontent.com/emyrinj/astatine-miner/v0.1.0-testnet.12/support/install-unix.sh | sh
+curl --fail --show-error --location https://raw.githubusercontent.com/emyrinj/astatine-miner/v0.1.0-testnet.13/support/install-unix.sh | sh
 ```
 
 To download and review the installer before executing it:
 
 ```sh
-curl --fail --show-error --location https://raw.githubusercontent.com/emyrinj/astatine-miner/v0.1.0-testnet.12/support/install-unix.sh -o "$HOME/astatine-install-unix.sh"
+curl --fail --show-error --location https://raw.githubusercontent.com/emyrinj/astatine-miner/v0.1.0-testnet.13/support/install-unix.sh -o "$HOME/astatine-install-unix.sh"
 less "$HOME/astatine-install-unix.sh"
 sh "$HOME/astatine-install-unix.sh"
 ```
@@ -31,14 +31,14 @@ Apple Silicon requires macOS 11 or later; Intel requires macOS 10.12 or later. T
 Supported target: Windows 10 or later, x86_64. The executable is installed under your user profile.
 
 ```powershell
-$Installer = Join-Path $env:TEMP 'astatine-install.ps1'; Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/emyrinj/astatine-miner/v0.1.0-testnet.12/support/install-windows.ps1' -OutFile $Installer; powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Installer
+$Installer = Join-Path $env:TEMP 'astatine-install.ps1'; Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/emyrinj/astatine-miner/v0.1.0-testnet.13/support/install-windows.ps1' -OutFile $Installer; powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Installer
 ```
 
 To download and review the PowerShell installer before executing it:
 
 ```powershell
 $Installer = Join-Path $env:TEMP 'astatine-install.ps1'
-Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/emyrinj/astatine-miner/v0.1.0-testnet.12/support/install-windows.ps1' -OutFile $Installer
+Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/emyrinj/astatine-miner/v0.1.0-testnet.13/support/install-windows.ps1' -OutFile $Installer
 Get-Content -LiteralPath $Installer -Raw
 # After reviewing the script:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Installer
@@ -69,7 +69,7 @@ astatine mine --device gpu --compute-only
 
 Explicit `gpu` mode stops with an actionable error if no physical adapter passes the actual WGSL SHA-256d self-test. It never silently becomes CPU mining. `auto` performs a short canonical-work comparison and chooses GPU only when its measured throughput is more than 10% faster than CPU; otherwise it chooses CPU. Auto mode also falls back to CPU if GPU operation later fails. Any in-flight GPU nonce range is abandoned on failure, not reassigned. `--threads` controls CPU mining workers; GPU mode uses a dedicated controller and does not start the full CPU mining pool.
 
-Every GPU candidate is rehashed with the canonical Rust `WorkHasher` before it enters the existing bounded proof inbox. The existing proof preflight, journal, signing, submission, finalization, reward reconciliation, and forwarding pipelines remain authoritative. The GPU module does not own wallets, RPC connections, or transaction signing.
+Every GPU candidate is rehashed with the canonical Rust `WorkHasher` before it enters the existing bounded proof inbox. The existing proof preflight, journal, signing, submission, finalization, and reward-reconciliation paths remain authoritative. The GPU module does not own wallets, RPC connections, or transaction signing.
 
 ### Starting before genesis
 
@@ -81,7 +81,7 @@ An activation candidate triggers the existing canonical full-snapshot path. The 
 astatine mine --device gpu --nodes 1,2,3,4,5,6,7,8,9
 ```
 
-The existing proof verification, spending cap, minimum reserve, transaction journal, recovery, reorganization handling and opt-in reward forwarding remain in force after activation.
+The existing proof verification, spending cap, minimum reserve, transaction journal, recovery, and reorganization handling remain in force after activation. Automatic AST reward forwarding is disabled in Testnet.13 because the selected RPC can fabricate reward evidence.
 
 Inspect local compute adapters and run their real shader self-test without connecting to RPC or unlocking a wallet:
 
@@ -93,7 +93,7 @@ The wgpu backends target Metal on macOS, Direct3D 12 or Vulkan on Windows, and V
 
 | Platform / GPU | Preferred backend | Testnet.12 evidence |
 |---|---|---|
-| Apple Silicon · Apple M4 | Metal | Physical shader parity, three-window mining/reward forwarding, 1/3/9-node genesis activation, and one-second pre-genesis polling tested |
+| Apple Silicon · Apple M4 | Metal | Physical shader parity, three-window mining/reward reconciliation, 1/3/9-node genesis activation, and one-second pre-genesis polling tested |
 | Intel macOS GPU | Metal | Native target CI passes; physical GPU runtime not tested |
 | NVIDIA / AMD Windows GPU | Direct3D 12 or Vulkan | Native Windows CI passes; physical GPU runtime not tested |
 | NVIDIA / AMD Linux GPU | Vulkan | Native Linux CI passes; physical GPU runtime not tested |
@@ -117,9 +117,33 @@ Use measured results for the installed hardware. The GPU shader implements SHA-2
 
 The Testnet.11 M4/Metal reference supplied for this release is `69.102 MH/s` GPU median and `23.284 MH/s` CPU median (four CPU workers). A fresh comparable Testnet.12 run measured GPU `68.689 MH/s` median (`68.689`, `68.677`, `68.738 MH/s`) and CPU `22.304 MH/s` median (`22.727`, `22.304`, `22.126 MH/s`). Across fifteen local Testnet.12 samples, the combined GPU median is `68.568 MH/s`. The GPU shader and compute pipeline were not changed. Full per-run samples, methodology, genesis activation latencies, and timing limitations are in [the Testnet.12 performance report](support/testnet12-performance.md). Metal exposes no wgpu GPU timestamp queries on this adapter, so dispatch-to-readback is wall latency, not isolated shader time. These are measured results, not a guarantee across devices; run `astatine benchmark` on the target hardware.
 
-The archives are authenticated by the pinned RSA-3072 key in addition to HTTPS. Its SHA-256 SubjectPublicKeyInfo fingerprint is `e610269b1a6dffe64eb1b9b4d97e9cca434884f5908a38888e310bdd74322e7c`; the PEM and Windows XML forms are in `support/release-signing-public.*`. macOS binaries are not Developer ID signed or notarized, and Windows binaries are not Authenticode signed; the release manifest signature provides the project-level authenticity check.
+Release manifests are authenticated by a pinned RSA-3072 key in addition to
+HTTPS. The currently embedded key's SHA-256 SubjectPublicKeyInfo fingerprint is
+`7a89234d5b269bb5372eab957e66307e321f4d9de9a550f7a2d7a6783cc50650`. This
+owner-supplied key is integrated across the Rust updater, Unix/Windows
+installers, and release validators; `support/release-key-fingerprint.txt`
+contains the matching active fingerprint. Before signing, the offline signer
+requires the selected private key to derive this exact public anchor. Replacing
+the pin means existing Testnet.12 clients with the legacy key cannot verify
+releases signed only by the new key. This candidate does not include a
+backward-compatible bridge; clients that require automatic updates from
+Testnet.12 need a migration path before release. macOS binaries are not
+Developer ID signed or notarized, and Windows binaries are not Authenticode
+signed.
 
-GitHub build-provenance attestations are published for the release archives, native executables, and signed manifest. To inspect one, use `gh attestation verify astatine-linux-x86_64.tar.gz --repo emyrinj/astatine-miner` with the GitHub CLI.
+GitHub Actions only builds/tests unsigned artifacts and creates provenance for
+the exact source commit. Creating a tag does not publish a release. The owner
+downloads and independently verifies the asset attestations, signs the manifest
+offline, then explicitly publishes the signed 15-asset inventory with
+`support/publish_signed_release.py`. See
+[`support/OFFLINE_RELEASE_PROCESS.md`](support/OFFLINE_RELEASE_PROCESS.md) for
+the owner commands and recovery behavior. To inspect build provenance for an
+unsigned package, use:
+
+```sh
+gh attestation verify astatine-linux-x86_64.tar.gz \
+  --repo "$(tr -d '\n' < support/release-repository.txt)"
+```
 
 ## Use
 
@@ -130,22 +154,66 @@ astatine mine --device cpu
 astatine mine --device gpu --nodes 1,2,3,4,5,6,7,8,9
 astatine mine --device auto --nodes 1,3,5
 astatine mine --device gpu --compute-only
-astatine mine --device gpu --send-rewards-to 0x0123456789abcdef0123456789abcdef01234567
 astatine devices
 astatine benchmark
 astatine update
 astatine update --check
 ```
 
-`astatine init` configures the wallet, network, CPU budget, reserve, transaction cap, and confirmation depth. Startup shows configuration, RPC/deployment checks, transaction recovery, wallet unlock, initial work, worker preparation and when historical reward verification is scheduled; detailed history counters are hidden during ordinary startup. Historical reward verification runs in the background so live proof work can continue while older events are checked. Interactive terminals use a subtle spinner, while redirected output uses plain-text progress. The mining dashboard shows live node state, INJ and AST balances, canonically verified rewards mined during the current invocation, hashrate, transaction, and session-exposure status; it distinguishes proof checking, signed-but-not-yet-broadcast, broadcast/confirmation, chain waiting, required/retrying finalization, and policy-blocked finalization. Autonomous mining retains the best queued proof per node in a bounded inbox, revalidates it against current verified work, and reports bounded per-node proof-pipeline counters on exit (including rejection reasons, paid-attempt suppression, broadcast, and verified candidate events). `--compute-only` hashes locally without unlocking a wallet or sending transactions. Use `--nodes 1,3,5` to restrict mining to selected nodes.
+`astatine init` configures the wallet, network, RPC, CPU budget, reserve, authorization cap, and confirmation depth. Startup shows configuration, RPC/deployment checks, transaction recovery, wallet unlock, initial work, worker preparation and when historical reward reconciliation is scheduled; detailed history counters are hidden during ordinary startup. Historical reward reconciliation runs in the background so live proof work can continue while older events are checked against the selected RPC. Interactive terminals use a subtle spinner, while redirected output uses plain-text progress. The mining dashboard shows live node state, RPC-reported INJ and AST balances, RPC-reported rewards for the current invocation, hashrate, transaction state, cumulative maximum authorization, remaining authorization budget, and RPC-reported actual cost. It distinguishes proof checking, signed-but-not-yet-broadcast, broadcast/confirmation, chain waiting, required/retrying finalization, and policy-blocked finalization. Autonomous mining retains the best queued proof per node in a bounded inbox, revalidates it against current work, and reports bounded per-node proof-pipeline counters on exit. `--compute-only` hashes locally without unlocking a wallet or sending transactions. Use `--nodes 1,3,5` to restrict mining to selected nodes.
 
-Reward forwarding is off by default. `--send-rewards-to ADDRESS` explicitly authorizes this invocation to transfer only an AST payout verified from a canonical winning window receipt to that destination. The transfer amount is exact, the destination is persisted in the transaction journal, and the transfer fee counts toward the configured INJ session cap and reserve. It cannot be combined with `--compute-only`; the mining wallet's AST balance may decrease while `MINED` remains the total verified reward earned in this invocation. If a payout is pending or blocked, resume with the same destination before selecting another one.
+Automatic AST reward forwarding is disabled in Testnet.13. Passing `--send-rewards-to ADDRESS` is rejected with an explanation: a selected RPC can fabricate a mutually consistent proof receipt, payout events, balances, and confirmations, which could otherwise authorize a real AST transfer from the mining wallet. Reward reconciliation and the `MINED` display remain available, but they are based on selected-RPC data and are not independent proof of payout. Verify a reward through an independent trusted source before making any manual transfer.
 
 Set `ASTATINE_HISTORY_PROFILE=1` before `astatine mine` (or `$env:ASTATINE_HISTORY_PROFILE='1'` in PowerShell) to print aggregate history profiling at startup and shutdown for developer diagnostics. The profile contains counters and timings only. Normal startup continues to display actionable transaction/RPC warnings and the background reward-verification status without the aggregate dump.
 
-New encrypted Ethereum V3 keystores accept passwords of at least four Unicode characters and at most 1024 bytes. Input is hidden and confirmed. A brief, non-blocking warning recommends a longer unique password when fewer than 12 characters are chosen. This applies to new wallets and mnemonic imports; importing an existing V3 keystore continues to use its original password.
+New encrypted Ethereum V3 keystores require passwords of at least 12 Unicode characters and at most 1024 bytes. Input is hidden and confirmed. A brief, non-blocking warning recommends a longer unique passphrase when fewer than 16 characters are chosen. This applies to new wallets and mnemonic imports; importing an existing V3 keystore continues to use its original password without a new minimum.
 
-**Transaction costs:** Each proof submission pays a `0.01 INJ` fee. Finalizing a window consumes INJ gas, including when the window is empty or another miner wins. AST forwarding transfers also consume INJ gas. These costs count toward the configured per-session cap. The default cap is zero, which disables transaction signing; a positive cap explicitly authorizes spending. Mainnet transaction signing is disabled.
+**Transaction costs and authorization cap:** Each proof submission pays a `0.01 INJ` fee. Finalizing a window consumes INJ gas, including when the window is empty or another miner wins. For every signed transaction, Astatine durably charges `gas_limit × max_fee_per_gas + transaction_value` against the session cap before producing the signature. That maximum authorization is cumulative and is never refunded or reduced by RPC receipts, reported gas usage, or a completed transaction. The dashboard separates maximum authorized exposure from RPC-reported actual costs. A positive cap authorizes spending; the default zero cap disables signing. Use `astatine mine --new-session` to explicitly start a separate session after a prior spending session has been closed. It is refused while transactions are unresolved. Mainnet transaction signing is disabled.
+
+The spending journal is stored locally with private file permissions, atomic writes, and archive checks. The cap's integrity assumes that the local journal and archives have not been intentionally rewritten: Astatine does not have an independent cryptographic or hardware-backed monotonic anchor for them. A process running as the same OS account (or an administrator/root user) can rewrite valid journal data, so the cap is not a defense against a compromised same-account environment. It is a per-session cap, not a lifetime spending limit; explicitly starting a new session authorizes a separate cap.
+
+## RPC Configuration & Trust
+
+Astatine uses the selected network’s RPC URL from the bundled deployment manifest by default. The bundled Testnet primary is `https://k8s.testnet.json-rpc.injective.network/`. You do not need to operate an RPC node. `astatine init` displays the active network’s bundled default and lets you enter a custom RPC; pressing Enter keeps the current selection. Re-running setup keeps an existing custom RPC unless you change it.
+
+View or change the current network’s selection:
+
+```sh
+astatine get rpc
+astatine set rpc
+astatine set rpc https://my-trusted-rpc.example.com
+astatine set rpc default
+```
+
+PowerShell uses the same commands with `astatine.exe`:
+
+```powershell
+astatine.exe get rpc
+astatine.exe set rpc
+astatine.exe set rpc https://my-trusted-rpc.example.com
+astatine.exe set rpc default
+```
+
+Use `--network testnet` or `--network mainnet` on `get rpc` and `set rpc` to
+inspect or change that network’s override without changing the selected network.
+`astatine init --rpc https://my-trusted-rpc.example.com` validates and saves an
+override for the selected network. `astatine set rpc` without a URL is
+interactive; type `default` to restore the bundled endpoint. A remote endpoint
+must use HTTPS and return the selected network’s expected chain ID. HTTP is
+accepted only for local loopback development endpoints. URL credentials are not
+accepted; paths and query parameters are redacted in CLI output because some
+providers use them for API tokens.
+
+Astatine trusts the selected RPC provider for blockchain state, receipts and
+reward evidence; it does not cryptographically authenticate all RPC data. A
+malicious or compromised provider can return false work, transaction, receipt or
+reward information. Automatic AST reward forwarding is disabled because such
+false reward evidence must not authorize a transfer. The bundled archival
+endpoint is only a historical-log fallback with the bundled primary. It is not
+silently substituted when a custom primary is selected. The local session
+authorization cap does not depend on receipt correctness: receipts never
+replenish signing authority. Cap integrity assumes the same-account local
+journal and archives have not been intentionally rewritten.
 
 ## License
 

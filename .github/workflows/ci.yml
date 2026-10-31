@@ -7,9 +7,23 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      release_rehearsal:
+        description: Run the unsigned release artifact and Windows package rehearsal without creating a tag
+        required: true
+        default: false
+        type: boolean
+      release_tag:
+        description: Testnet package version used by the nonpublishing rehearsal
+        required: true
+        default: v0.1.0-testnet.13
+        type: string
 
 permissions:
   contents: read
+
+env:
+  RUSTUP_TOOLCHAIN: "1.94.1"
 
 jobs:
   native-checks:
@@ -38,7 +52,7 @@ jobs:
     env:
       CARGO_TARGET_DIR: target
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # actions/checkout v7.0.1
       - name: Verify release tag matches Cargo package version
         if: github.ref_type == 'tag'
         shell: bash
@@ -46,8 +60,17 @@ jobs:
           set -euo pipefail
           package_version="$(awk -F'"' '/^version =/ { print $2; exit }' Cargo.toml)"
           test "v$package_version" = "$GITHUB_REF_NAME"
-      - name: Install stable Rust components
-        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+      - name: Verify workflow-dispatch rehearsal version
+        if: github.event_name == 'workflow_dispatch' && inputs.release_rehearsal
+        shell: bash
+        env:
+          RELEASE_REHEARSAL_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          package_version="$(awk -F'"' '/^version =/ { print $2; exit }' Cargo.toml)"
+          test "v$package_version" = "$RELEASE_REHEARSAL_TAG"
+      - name: Install pinned Rust toolchain components
+        run: rustup toolchain install 1.94.1 --profile minimal --component rustfmt --component clippy
       - name: Verify native runner architecture
         shell: bash
         run: |
@@ -61,6 +84,9 @@ jobs:
         run: cargo check --locked
       - name: Unit tests
         run: cargo test --locked
+      - name: Unix installer downgrade checks
+        shell: bash
+        run: sh support/test-install-unix-version.sh
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Native release build
@@ -91,6 +117,8 @@ jobs:
             'support/install-windows.ps1' = Get-Content support/install-windows.ps1 -Raw
             'support/update-windows.ps1' = Get-Content support/update-windows.ps1 -Raw
             'support/verify-public-install-windows.ps1' = Get-Content support/verify-public-install-windows.ps1 -Raw
+            'support/test-unsigned-windows-package.ps1' = Get-Content support/test-unsigned-windows-package.ps1 -Raw
+            'support/test-install-windows-version.ps1' = Get-Content support/test-install-windows-version.ps1 -Raw
           }
           for ($Index = 0; $Index -lt $CodeBlocks.Count; $Index++) {
             $Scripts["README.md PowerShell block $Index"] = $CodeBlocks[$Index].Groups[1].Value
@@ -101,6 +129,7 @@ jobs:
             [System.Management.Automation.Language.Parser]::ParseInput($Scripts[$Name], [ref]$Tokens, [ref]$Errors) | Out-Null
             if ($Errors.Count -ne 0) { throw "$Name`n$($Errors | Out-String)" }
           }
+          & ./support/test-install-windows-version.ps1
       - name: Build Windows password prompt smoke
         if: matrix.target == 'x86_64-pc-windows-msvc'
         run: cargo build --locked --release --example windows_password_prompt
@@ -116,22 +145,62 @@ jobs:
           }
           if ($Prompt.ExitCode -ne 0) { throw "Windows hidden-password console smoke failed (exit code $($Prompt.ExitCode))" }
       - name: Upload native release executable
-        if: github.event_name == 'push'
-        uses: actions/upload-artifact@v7.0.2
+        if: github.ref_type == 'tag' || (github.event_name == 'workflow_dispatch' && inputs.release_rehearsal)
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # actions/upload-artifact v7.0.2
         with:
           name: astatine-${{ matrix.target }}
           path: target/release/${{ matrix.binary }}
           if-no-files-found: error
           retention-days: 14
 
+  attest-native-release-binaries:
+    name: Attest tested native release binaries
+    if: startsWith(github.ref, 'refs/tags/v0.1.0-testnet.') || (github.event_name == 'workflow_dispatch' && inputs.release_rehearsal)
+    needs: [native-checks]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # actions/download-artifact v8.0.2
+        with:
+          path: ${{ runner.temp }}/native-binaries
+      - name: Attest binaries emitted by the tested platform matrix
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # actions/attest-build-provenance v4.2.2
+        with:
+          subject-path: |
+            ${{ runner.temp }}/native-binaries/astatine-aarch64-apple-darwin/astatine
+            ${{ runner.temp }}/native-binaries/astatine-x86_64-apple-darwin/astatine
+            ${{ runner.temp }}/native-binaries/astatine-x86_64-unknown-linux-gnu/astatine
+            ${{ runner.temp }}/native-binaries/astatine-aarch64-unknown-linux-gnu/astatine
+            ${{ runner.temp }}/native-binaries/astatine-x86_64-pc-windows-msvc/astatine.exe
+
   dependency-policy:
     name: Dependency, advisory, and license checks
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
-      - name: Install stable Rust components
-        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # actions/checkout v7.0.1
+      - name: Require immutable full-SHA workflow action references
+        run: python3 support/check_workflow_pins.py
+      - name: Rehearse signed release validation with synthetic artifacts and a temporary key
+        run: python3 support/release_artifacts.py self-test
+      - name: Verify exact repository identity pins
+        run: python3 support/check_release_identity.py
+      - name: Verify the active owner public-key pin set
+        run: python3 support/release_public_key.py check
+      - name: Rehearse public-key pin synchronization with a synthetic key
+        run: python3 support/release_public_key.py self-test
+      - name: Test provenance validation with synthetic metadata
+        run: python3 support/verify_release_provenance.py --self-test
+      - name: Rehearse offline signing with synthetic keys only
+        run: python3 support/offline_sign_release.py --self-test
+      - name: Rehearse signature-gated manual publication with synthetic assets
+        run: python3 support/publish_signed_release.py --self-test
+      - name: Install pinned Rust toolchain components
+        run: rustup toolchain install 1.94.1 --profile minimal --component rustfmt --component clippy
       - name: Install pinned dependency validation tools
         run: |
           cargo install cargo-deny --locked --version 0.20.2
@@ -139,6 +208,17 @@ jobs:
           cargo install cargo-audit --locked --version 0.22.2
       - name: Validate dependency policies
         run: cargo deny check
+      - name: Keep inactive vulnerable optional package out of the active graph
+        run: |
+          set -euo pipefail
+          cargo tree --locked --all-features --target all -i crypto-bigint@0.5.5 > "$RUNNER_TEMP/crypto-bigint-0.5.5-tree.txt" 2>&1
+          python3 - "$RUNNER_TEMP/crypto-bigint-0.5.5-tree.txt" <<'PY'
+          import pathlib
+          import sys
+
+          tree = pathlib.Path(sys.argv[1]).read_text()
+          assert "crypto-bigint v0.5.5" not in tree, "RUSTSEC-2026-0387 package entered the active all-features/all-targets graph"
+          PY
       - name: Audit locked dependencies
         run: cargo audit --ignore RUSTSEC-2026-0387
       - name: Regenerate third-party license notices
@@ -151,7 +231,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # actions/checkout v7.0.1
       # The upstream source repos are private; CI uses checked-in creation bytecode
       # and verifies each fixture's pinned source commit before running Anvil.
       - name: Verify pinned Anvil fixture provenance
@@ -170,40 +250,62 @@ jobs:
               actual_commit = json.loads((fixtures / name).read_text())["source_commit"]
               assert actual_commit == expected_commit, (name, actual_commit, expected_commit)
           PY
-      - name: Install stable Rust components
-        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
-      - uses: foundry-rs/foundry-toolchain@v1
+      - name: Install pinned Rust toolchain components
+        run: rustup toolchain install 1.94.1 --profile minimal --component rustfmt --component clippy
+      - name: Install Foundry v1.8.7 from its digest-pinned Linux release asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/foundry_v1.8.7_linux_amd64.tar.gz"
+          curl --fail --show-error --location --retry 2 \
+            https://github.com/foundry-rs/foundry/releases/download/v1.8.7/foundry_v1.8.7_linux_amd64.tar.gz \
+            --output "$archive"
+          printf '%s  %s\n' \
+            'ba470eb718e779e4b0e3f1520b5284231b1bf98e9a39de07fb8f77ed70525bcf' \
+            "$archive" | sha256sum --check --status
+          mkdir -p "$RUNNER_TEMP/foundry-v1.8.7"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/foundry-v1.8.7"
+          test -x "$RUNNER_TEMP/foundry-v1.8.7/anvil"
+          test -x "$RUNNER_TEMP/foundry-v1.8.7/forge"
+          echo "$RUNNER_TEMP/foundry-v1.8.7" >> "$GITHUB_PATH"
       - name: Verify local EVM tools
         run: forge --version && anvil --version
       - name: Run all local Anvil lifecycle tests
         run: cargo test --release --locked -- --ignored --test-threads=1
 
-  package-release:
-    name: Package and authenticate Testnet release
-    if: startsWith(github.ref, 'refs/tags/v0.1.0-testnet.')
-    needs: [native-checks, dependency-policy, anvil-integration]
+  build-release-package:
+    name: Build unsigned Testnet release packages
+    if: startsWith(github.ref, 'refs/tags/v0.1.0-testnet.') || (github.event_name == 'workflow_dispatch' && inputs.release_rehearsal)
+    needs: [native-checks, attest-native-release-binaries, dependency-policy, anvil-integration]
     runs-on: ubuntu-22.04
     timeout-minutes: 15
     permissions:
       contents: read
-      id-token: write
-      attestations: write
+    env:
+      RELEASE_TAG: ${{ (github.event_name == 'workflow_dispatch' && inputs.release_rehearsal && inputs.release_tag) || github.ref_name }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # actions/checkout v7.0.1
       - name: Require the release tag to identify current main
+        if: github.ref_type == 'tag'
         shell: bash
         run: |
           set -euo pipefail
           git fetch --no-tags origin main
           main_sha="$(git rev-parse FETCH_HEAD)"
           test "$GITHUB_SHA" = "$main_sha"
-      - uses: actions/download-artifact@v8.0.2
+      - name: Require the nonpublishing rehearsal to use this clean source commit
+        if: github.event_name == 'workflow_dispatch' && inputs.release_rehearsal
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_SHA" = "$(git rev-parse HEAD)"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # actions/download-artifact v8.0.2
         with:
           path: ${{ runner.temp }}/native-binaries
       - name: Assemble reproducible archives and checksums
         shell: bash
-        env:
-          ASTATINE_RELEASE_SIGNING_KEY: ${{ secrets.ASTATINE_RELEASE_SIGNING_KEY }}
         run: |
           set -euo pipefail
           native="$RUNNER_TEMP/native-binaries"
@@ -240,8 +342,10 @@ jobs:
           tar --sort=name --mtime="@$source_date_epoch" --owner=0 --group=0 --numeric-owner -cf - -C "$package/stage/linux-aarch64" astatine LICENSE-MIT THIRD_PARTY_LICENSES.md | gzip -n > "$package/astatine-linux-aarch64.tar.gz"
           (cd "$package/stage/windows-x86_64" && zip -X "$package/astatine-windows-x86_64.zip" astatine.exe LICENSE-MIT THIRD_PARTY_LICENSES.md)
 
-          python3 - "$package" "$GITHUB_REF_NAME" <<'PY'
+          python3 - "$package" "$RELEASE_TAG" <<'PY'
           import hashlib
+          import io
+          import os
           import pathlib
           import sys
           import re
@@ -252,6 +356,8 @@ jobs:
           assert match, "Cargo.toml package version is missing"
           version = match.group(1)
           assert tag == f"v{version}", f"tag {tag} does not match package version {version}"
+          repository = pathlib.Path("support/release-repository.txt").read_text(encoding="ascii").strip()
+          assert repository == os.environ["GITHUB_REPOSITORY"], "workflow repository does not match the pinned release identity"
           assets = {}
           for target in ("macos-aarch64", "macos-x86_64", "linux-aarch64", "linux-x86_64", "windows-x86_64"):
               binary = f"astatine-{target}.exe" if target == "windows-x86_64" else f"astatine-{target}"
@@ -262,7 +368,7 @@ jobs:
               assets[f"license.{filename}"] = filename
           lines = [
               "astatine-update-manifest-v1",
-              "repository=emyrinj/astatine-miner",
+              f"repository={repository}",
               "channel=testnet",
               f"version={version}",
           ]
@@ -277,37 +383,7 @@ jobs:
           (root / "update-manifest.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
           PY
 
-          if [[ -z "${ASTATINE_RELEASE_SIGNING_KEY:-}" ]]; then
-            echo "ASTATINE_RELEASE_SIGNING_KEY repository secret is required to sign releases" >&2
-            exit 1
-          fi
-          signing_key="$RUNNER_TEMP/astatine-release-signing.pem"
-          trap 'rm -f "$signing_key" "$RUNNER_TEMP/release-public-key.der" "$RUNNER_TEMP/pinned-public-key.der"' EXIT
-          printf '%s\n' "$ASTATINE_RELEASE_SIGNING_KEY" > "$signing_key"
-          chmod 600 "$signing_key"
-          openssl pkey -in "$signing_key" -pubout -outform DER -out "$RUNNER_TEMP/release-public-key.der"
-          openssl pkey -pubin -in support/release-signing-public.pem -outform DER -out "$RUNNER_TEMP/pinned-public-key.der"
-          cmp "$RUNNER_TEMP/release-public-key.der" "$RUNNER_TEMP/pinned-public-key.der"
-          openssl dgst -sha256 -sign "$signing_key" -out "$package/update-manifest.sig" "$package/update-manifest.txt"
-
           cd "$package"
-          sha256sum \
-            astatine-macos-aarch64.tar.gz \
-            astatine-macos-x86_64.tar.gz \
-            astatine-linux-x86_64.tar.gz \
-            astatine-linux-aarch64.tar.gz \
-            astatine-windows-x86_64.zip \
-            astatine-macos-aarch64 \
-            astatine-macos-x86_64 \
-            astatine-linux-aarch64 \
-            astatine-linux-x86_64 \
-            astatine-windows-x86_64.exe \
-            LICENSE-MIT \
-            THIRD_PARTY_LICENSES.md \
-            update-manifest.txt \
-            update-manifest.sig > SHA256SUMS
-          openssl dgst -sha256 -verify "$GITHUB_WORKSPACE/support/release-signing-public.pem" -signature update-manifest.sig update-manifest.txt
-          sha256sum -c SHA256SUMS
           file stage/macos-aarch64/astatine stage/macos-x86_64/astatine \
             stage/linux-x86_64/astatine stage/linux-aarch64/astatine stage/windows-x86_64/astatine.exe
           tar -tzf astatine-macos-aarch64.tar.gz
@@ -355,25 +431,9 @@ jobs:
               for filename in expected:
                   assert archive.read(filename) == (source_root / filename).read_bytes()
           PY
-      - name: Attest release assets and signed update manifest
-        uses: actions/attest-build-provenance@v3
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # actions/upload-artifact v7.0.2
         with:
-          subject-path: |
-            ${{ runner.temp }}/testnet-package/astatine-macos-aarch64.tar.gz
-            ${{ runner.temp }}/testnet-package/astatine-macos-x86_64.tar.gz
-            ${{ runner.temp }}/testnet-package/astatine-linux-aarch64.tar.gz
-            ${{ runner.temp }}/testnet-package/astatine-linux-x86_64.tar.gz
-            ${{ runner.temp }}/testnet-package/astatine-windows-x86_64.zip
-            ${{ runner.temp }}/testnet-package/astatine-macos-aarch64
-            ${{ runner.temp }}/testnet-package/astatine-macos-x86_64
-            ${{ runner.temp }}/testnet-package/astatine-linux-aarch64
-            ${{ runner.temp }}/testnet-package/astatine-linux-x86_64
-            ${{ runner.temp }}/testnet-package/astatine-windows-x86_64.exe
-            ${{ runner.temp }}/testnet-package/update-manifest.txt
-            ${{ runner.temp }}/testnet-package/update-manifest.sig
-      - uses: actions/upload-artifact@v7.0.2
-        with:
-          name: astatine-${{ github.ref_name }}-release-packages
+          name: astatine-${{ env.RELEASE_TAG }}-unsigned-release-packages
           path: |
             ${{ runner.temp }}/testnet-package/astatine-macos-aarch64.tar.gz
             ${{ runner.temp }}/testnet-package/astatine-macos-x86_64.tar.gz
@@ -388,195 +448,105 @@ jobs:
             ${{ runner.temp }}/testnet-package/LICENSE-MIT
             ${{ runner.temp }}/testnet-package/THIRD_PARTY_LICENSES.md
             ${{ runner.temp }}/testnet-package/update-manifest.txt
-            ${{ runner.temp }}/testnet-package/update-manifest.sig
-            ${{ runner.temp }}/testnet-package/SHA256SUMS
           if-no-files-found: error
           retention-days: 14
 
-  windows-package-smoke:
-    name: Install and execute packaged Windows release
-    if: startsWith(github.ref, 'refs/tags/v0.1.0-testnet.')
-    needs: [package-release]
-    runs-on: windows-2025
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8.0.2
-        with:
-          name: astatine-${{ github.ref_name }}-release-packages
-          path: ${{ runner.temp }}/testnet-package
-      - name: Verify and install the Windows archive without administrator access
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $PSNativeCommandUseErrorActionPreference = $false
-          $Package = Join-Path $env:RUNNER_TEMP 'testnet-package'
-          $Archive = Join-Path $Package 'astatine-windows-x86_64.zip'
-          $ManifestPath = Join-Path $Package 'update-manifest.txt'
-          $SignaturePath = Join-Path $Package 'update-manifest.sig'
-          if ((Get-Item -LiteralPath $ManifestPath).Length -gt 2097152) { throw 'Signed manifest exceeds its size limit' }
-          if ((Get-Item -LiteralPath $SignaturePath).Length -ne 384) { throw 'Manifest signature has an invalid length' }
-          $Rsa = New-Object System.Security.Cryptography.RSACryptoServiceProvider
-          $Rsa.FromXmlString((Get-Content support/release-signing-public.xml -Raw))
-          $ManifestBytes = [System.IO.File]::ReadAllBytes($ManifestPath)
-          $SignatureBytes = [System.IO.File]::ReadAllBytes($SignaturePath)
-          $Sha256Oid = [System.Security.Cryptography.CryptoConfig]::MapNameToOID('SHA256')
-          if (-not $Rsa.VerifyData($ManifestBytes, $Sha256Oid, $SignatureBytes)) { throw 'Manifest signature verification failed' }
-          $ManifestLines = Get-Content -LiteralPath $ManifestPath
-          if ($ManifestLines -notcontains "version=$($env:GITHUB_REF_NAME.Substring(1))") { throw 'Manifest version does not match the release tag' }
-          if ($ManifestLines -notcontains 'repository=emyrinj/astatine-miner') { throw 'Manifest repository identity is invalid' }
-          if ($ManifestLines -notcontains 'channel=testnet') { throw 'Manifest channel is not Testnet' }
-          $SignedAsset = $ManifestLines | Where-Object { $_.StartsWith('asset.package.windows-x86_64=') }
-          $SignedRecord = $SignedAsset.Substring($SignedAsset.IndexOf('=') + 1).Split('|')
-          if ($SignedRecord.Count -ne 3 -or $SignedRecord[0] -ne 'astatine-windows-x86_64.zip') { throw 'Signed Windows package record is malformed' }
-          if ((Get-FileHash -Path $Archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $SignedRecord[1]) { throw 'Windows package SHA-256 does not match signed manifest' }
-          if ((Get-Item -LiteralPath $Archive).Length -ne [Int64]$SignedRecord[2]) { throw 'Windows package size does not match signed manifest' }
-          $Line = Get-Content (Join-Path $Package 'SHA256SUMS') | Where-Object { $_ -match '\s+astatine-windows-x86_64\.zip$' } | Select-Object -First 1
-          if (-not $Line) { throw 'Windows archive checksum is missing' }
-          $Expected = ($Line -split '\s+')[0].ToLowerInvariant()
-          $Actual = (Get-FileHash -Path $Archive -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($Actual -ne $Expected) { throw 'Packaged Windows executable checksum does not match SHA256SUMS' }
-
-          $ExtractDir = Join-Path $env:RUNNER_TEMP 'astatine-windows-extracted'
-          $InstallDir = Join-Path $env:RUNNER_TEMP 'astatine-windows-install\bin'
-          Expand-Archive -Path $Archive -DestinationPath $ExtractDir
-          New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
-          New-Item -ItemType Directory -Path (Join-Path $InstallDir 'licenses') -Force | Out-Null
-          Copy-Item (Join-Path $ExtractDir 'astatine.exe') (Join-Path $InstallDir 'astatine.exe')
-          Copy-Item (Join-Path $ExtractDir 'LICENSE-MIT') (Join-Path $InstallDir 'licenses\LICENSE-MIT')
-          Copy-Item (Join-Path $ExtractDir 'THIRD_PARTY_LICENSES.md') (Join-Path $InstallDir 'licenses\THIRD_PARTY_LICENSES.md')
-          $InstalledExecutable = Join-Path $InstallDir 'astatine.exe'
-          function Invoke-PackagedExecutableSmoke([string[]]$ExecutableArguments) {
-              Write-Host "Smoke testing packaged Windows executable: $($ExecutableArguments -join ' ')"
-              $ExecutableOutput = & $InstalledExecutable @ExecutableArguments 2>&1
-              $ExecutableExitCode = $LASTEXITCODE
-              if ($ExecutableExitCode -ne 0) {
-                  $ExecutableOutput | ForEach-Object { Write-Host $_ }
-                  throw "Packaged Windows executable failed '$($ExecutableArguments -join ' ')': exit code $ExecutableExitCode"
-              }
-          }
-          Invoke-PackagedExecutableSmoke -ExecutableArguments @('--version')
-          Invoke-PackagedExecutableSmoke -ExecutableArguments @('--help')
-          Invoke-PackagedExecutableSmoke -ExecutableArguments @('mine', '--help')
-
-          $HelperRoot = Join-Path $env:RUNNER_TEMP 'astatine-update-helper-smoke'
-          $HelperLicenses = Join-Path $HelperRoot 'licenses'
-          $HelperExe = Join-Path $HelperRoot 'astatine.exe'
-          New-Item -ItemType Directory -Path $HelperRoot -Force | Out-Null
-          New-Item -ItemType Directory -Path $HelperLicenses -Force | Out-Null
-          Copy-Item (Join-Path $ExtractDir 'astatine.exe') $HelperExe
-          Set-Content -LiteralPath (Join-Path $HelperLicenses 'LICENSE-MIT') 'old MIT notice'
-          Set-Content -LiteralPath (Join-Path $HelperLicenses 'THIRD_PARTY_LICENSES.md') 'old dependency notices'
-          $HelperPlan = Join-Path $HelperRoot 'plan.json'
-          $HelperLog = Join-Path $HelperRoot 'update.log'
-          $HelperLock = Join-Path $HelperRoot '.astatine-update.lock'
-          $DummyParent = Start-Process -FilePath $env:ComSpec -ArgumentList '/c', 'ping -n 3 127.0.0.1 > nul' -PassThru -WindowStyle Hidden
-
-          function Write-HelperPlan([string]$ExpectedVersion) {
-              $Files = @(
-                  @{ destination = $HelperExe; staged = "$HelperExe.update"; backup = "$HelperExe.backup" },
-                  @{ destination = (Join-Path $HelperLicenses 'LICENSE-MIT'); staged = (Join-Path $HelperLicenses 'LICENSE-MIT.update'); backup = (Join-Path $HelperLicenses 'LICENSE-MIT.backup') },
-                  @{ destination = (Join-Path $HelperLicenses 'THIRD_PARTY_LICENSES.md'); staged = (Join-Path $HelperLicenses 'THIRD_PARTY_LICENSES.md.update'); backup = (Join-Path $HelperLicenses 'THIRD_PARTY_LICENSES.md.backup') }
-              )
-              @{ expected_version = $ExpectedVersion; executable = $HelperExe; lock = $HelperLock; log = $HelperLog; files = $Files } |
-                  ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $HelperPlan -Encoding UTF8
-          }
-          Copy-Item (Join-Path $Package 'astatine-windows-x86_64.exe') "$HelperExe.update"
-          Copy-Item (Join-Path $ExtractDir 'LICENSE-MIT') (Join-Path $HelperLicenses 'LICENSE-MIT.update')
-          Copy-Item (Join-Path $ExtractDir 'THIRD_PARTY_LICENSES.md') (Join-Path $HelperLicenses 'THIRD_PARTY_LICENSES.md.update')
-          Write-HelperPlan $env:GITHUB_REF_NAME.Substring(1)
-          Write-Host 'Running Windows updater helper install-success case'
-          $HelperOutput = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File support/update-windows.ps1 -ParentPid $DummyParent.Id -PlanPath $HelperPlan 2>&1
-          $HelperExitCode = $LASTEXITCODE
-          $HelperOutput | ForEach-Object { Write-Host $_ }
-          if ($HelperExitCode -ne 0) {
-              if (Test-Path -LiteralPath $HelperLog) { Get-Content -LiteralPath $HelperLog }
-              throw "Windows update helper failed its successful install case (exit code $HelperExitCode)"
-          }
-          if ((Get-Content (Join-Path $HelperLicenses 'LICENSE-MIT') -Raw) -ne (Get-Content (Join-Path $ExtractDir 'LICENSE-MIT') -Raw)) { throw 'Windows update helper did not install license notices' }
-
-          $OldExecutableHash = (Get-FileHash -Path $HelperExe -Algorithm SHA256).Hash
-          Set-Content -LiteralPath (Join-Path $HelperLicenses 'LICENSE-MIT') 'preserve this on rollback'
-          Copy-Item (Join-Path $Package 'astatine-windows-x86_64.exe') "$HelperExe.update"
-          Copy-Item (Join-Path $ExtractDir 'LICENSE-MIT') (Join-Path $HelperLicenses 'LICENSE-MIT.update')
-          Copy-Item (Join-Path $ExtractDir 'THIRD_PARTY_LICENSES.md') (Join-Path $HelperLicenses 'THIRD_PARTY_LICENSES.md.update')
-          Write-HelperPlan '0.0.0-invalid'
-          Write-Host 'Running Windows updater helper rollback case'
-          $HelperOutput = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File support/update-windows.ps1 -ParentPid $DummyParent.Id -PlanPath $HelperPlan 2>&1
-          $HelperExitCode = $LASTEXITCODE
-          $HelperOutput | ForEach-Object { Write-Host $_ }
-          if ($HelperExitCode -eq 0) {
-              if (Test-Path -LiteralPath $HelperLog) { Get-Content -LiteralPath $HelperLog }
-              throw 'Windows update helper unexpectedly accepted a mismatched smoke-test version'
-          }
-          if ((Get-FileHash -Path $HelperExe -Algorithm SHA256).Hash -ne $OldExecutableHash) { throw 'Windows update helper failed to restore the previous executable' }
-          if ((Get-Content (Join-Path $HelperLicenses 'LICENSE-MIT') -Raw).Trim() -ne 'preserve this on rollback') { throw 'Windows update helper failed to restore the previous license notice' }
-          # The rollback scenario must fail internally; clear that expected native exit code after its assertions pass.
-          $global:LASTEXITCODE = 0
-
-  publish-testnet12-release:
-    name: Publish gated Testnet.12 prerelease
-    if: github.ref == 'refs/tags/v0.1.0-testnet.12'
-    needs: [native-checks, dependency-policy, anvil-integration, package-release, windows-package-smoke]
+  attest-unsigned-release:
+    name: Verify and attest unsigned Testnet release artifacts
+    if: startsWith(github.ref, 'refs/tags/v0.1.0-testnet.') || (github.event_name == 'workflow_dispatch' && inputs.release_rehearsal)
+    needs: [build-release-package, attest-native-release-binaries]
     runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    env:
+      RELEASE_TAG: ${{ (github.event_name == 'workflow_dispatch' && inputs.release_rehearsal && inputs.release_tag) || github.ref_name }}
     permissions:
-      contents: write
+      contents: read
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8.0.2
-        with:
-          name: astatine-${{ github.ref_name }}-release-packages
-          path: ${{ runner.temp }}/testnet-package
-      - name: Pin release installer links to the verified commit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # actions/checkout v7.0.1
+      - name: Require the release tag to identify current main
+        if: github.ref_type == 'tag'
         shell: bash
         run: |
           set -euo pipefail
-          python3 - support/release-notes-v0.1.0-testnet.12.md "$RUNNER_TEMP/testnet12-release-notes.md" "$GITHUB_SHA" <<'PY'
-          import pathlib
-          import sys
-
-          template = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
-          commit = sys.argv[3]
-          assert len(commit) == 40 and all(char in "0123456789abcdef" for char in commit)
-          notes = template.replace("__RELEASE_COMMIT__", commit)
-          assert "__RELEASE_COMMIT__" not in notes
-          pathlib.Path(sys.argv[2]).write_text(notes, encoding="utf-8")
-          PY
-      - name: Publish prerelease assets after every validation gate passes
+          git fetch --no-tags origin main
+          test "$GITHUB_SHA" = "$(git rev-parse FETCH_HEAD)"
+      - name: Require the nonpublishing rehearsal to use this clean source commit
+        if: github.event_name == 'workflow_dispatch' && inputs.release_rehearsal
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_SHA" = "$(git rev-parse HEAD)"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # actions/download-artifact v8.0.2
+        with:
+          name: astatine-${{ env.RELEASE_TAG }}-unsigned-release-packages
+          path: ${{ runner.temp }}/unsigned-testnet-package
+      - name: Verify raw platform binaries against build attestations
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-        shell: bash
         run: |
           set -euo pipefail
-          tag="$GITHUB_REF_NAME"
-          package="$RUNNER_TEMP/testnet-package"
-          assets=("$package"/*)
-          test "${#assets[@]}" -eq 15
-          if gh release view "$tag" --repo emyrinj/astatine-miner >/dev/null 2>&1; then
-            gh release upload "$tag" "${assets[@]}" --repo emyrinj/astatine-miner --clobber
-            gh release edit "$tag" --repo emyrinj/astatine-miner \
-              --title "Astatine $tag — Injective Testnet" \
-              --notes-file "$RUNNER_TEMP/testnet12-release-notes.md" \
-              --prerelease
-          else
-            gh release create "$tag" "${assets[@]}" \
-              --repo emyrinj/astatine-miner \
-              --title "Astatine $tag — Injective Testnet" \
-              --notes-file "$RUNNER_TEMP/testnet12-release-notes.md" \
-              --prerelease
-          fi
-          gh release view "$tag" --repo emyrinj/astatine-miner --json tagName,isPrerelease,url
+          package="$RUNNER_TEMP/unsigned-testnet-package"
+          for binary in \
+            astatine-macos-aarch64 \
+            astatine-macos-x86_64 \
+            astatine-linux-x86_64 \
+            astatine-linux-aarch64 \
+            astatine-windows-x86_64.exe; do
+            gh attestation verify "$package/$binary" \
+              --repo "$GITHUB_REPOSITORY" \
+              --source-ref "$GITHUB_REF" \
+              --source-digest "$GITHUB_SHA" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/ci.yml" \
+              --deny-self-hosted-runners
+          done
+      - name: Validate transferred artifact and test substitution rejection
+        shell: bash
+        run: >-
+          python3 support/release_artifacts.py verify-unsigned
+          --root "$RUNNER_TEMP/unsigned-testnet-package"
+          --tag "$RELEASE_TAG"
+          --license-root "$GITHUB_WORKSPACE"
+      - name: Attest validated unsigned release assets
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # attest-build-provenance v4.2.2
+        with:
+          subject-path: |
+            ${{ runner.temp }}/unsigned-testnet-package/astatine-macos-aarch64.tar.gz
+            ${{ runner.temp }}/unsigned-testnet-package/astatine-macos-x86_64.tar.gz
+            ${{ runner.temp }}/unsigned-testnet-package/astatine-linux-aarch64.tar.gz
+            ${{ runner.temp }}/unsigned-testnet-package/astatine-linux-x86_64.tar.gz
+            ${{ runner.temp }}/unsigned-testnet-package/astatine-windows-x86_64.zip
+            ${{ runner.temp }}/unsigned-testnet-package/astatine-macos-aarch64
+            ${{ runner.temp }}/unsigned-testnet-package/astatine-macos-x86_64
+            ${{ runner.temp }}/unsigned-testnet-package/astatine-linux-aarch64
+            ${{ runner.temp }}/unsigned-testnet-package/astatine-linux-x86_64
+            ${{ runner.temp }}/unsigned-testnet-package/astatine-windows-x86_64.exe
+            ${{ runner.temp }}/unsigned-testnet-package/LICENSE-MIT
+            ${{ runner.temp }}/unsigned-testnet-package/THIRD_PARTY_LICENSES.md
+            ${{ runner.temp }}/unsigned-testnet-package/update-manifest.txt
 
-  post-release-public-install:
-    name: Verify public Windows installer after publication
-    if: github.ref == 'refs/tags/v0.1.0-testnet.12'
-    needs: [publish-testnet12-release]
+  windows-unsigned-package-smoke:
+    name: Verify and execute unsigned Windows package
+    if: startsWith(github.ref, 'refs/tags/v0.1.0-testnet.') || (github.event_name == 'workflow_dispatch' && inputs.release_rehearsal)
+    needs: [attest-unsigned-release]
     runs-on: windows-2025
     timeout-minutes: 10
+    env:
+      RELEASE_TAG: ${{ (github.event_name == 'workflow_dispatch' && inputs.release_rehearsal && inputs.release_tag) || github.ref_name }}
     steps:
-      - uses: actions/checkout@v7
-      - name: Download and execute the commit-pinned public installer
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # actions/checkout v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # actions/download-artifact v8.0.2
+        with:
+          name: astatine-${{ env.RELEASE_TAG }}-unsigned-release-packages
+          path: ${{ runner.temp }}/testnet-package
+      - name: Verify and execute the Windows archive without administrator access
         shell: pwsh
         run: |
-          & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File support/verify-public-install-windows.ps1 -CommitSha $env:GITHUB_SHA
-          if ($LASTEXITCODE -ne 0) { throw 'Public Windows installer verification failed' }
+          & ./support/test-unsigned-windows-package.ps1 `
+            -PackageDirectory (Join-Path $env:RUNNER_TEMP 'testnet-package') `
+            -ReleaseTag $env:RELEASE_TAG `
+            -Repository $env:GITHUB_REPOSITORY `
+            -TemporaryDirectory $env:RUNNER_TEMP

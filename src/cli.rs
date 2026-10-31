@@ -17,6 +17,13 @@ pub enum Command {
     Mine(MineArgs),
     Wallet(WalletCommand),
     NetworkUse(Network),
+    GetRpc {
+        network: Option<Network>,
+    },
+    SetRpc {
+        network: Option<Network>,
+        endpoint: Option<String>,
+    },
     Nodes,
     Status,
     Rewards,
@@ -71,6 +78,7 @@ pub struct MineArgs {
     pub threads: Option<NonZeroUsize>,
     pub nodes: Vec<u8>,
     pub send_rewards_to: Option<Address>,
+    pub new_session: bool,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -80,6 +88,7 @@ pub struct InitArgs {
     pub minimum_reserve_inj: Option<String>,
     pub spending_limit_inj: Option<String>,
     pub transaction_confirmations: Option<u8>,
+    pub rpc: Option<String>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -143,7 +152,7 @@ fn command() -> ClapCommand {
         .version(env!("CARGO_PKG_VERSION"))
         .about("A native command-line miner for Astatine")
         .long_about(
-            "Astatine is a non-custodial CPU/GPU miner. CPU is the default backend. GPU candidates are checked again by the canonical CPU WorkHasher before entering the bounded proof pipeline. Default mining may sign Testnet proof and finalization transactions within the configured session spending cap. Permissionless finalization can spend gas for empty windows or windows won by another miner. --compute-only never signs or submits transactions. Mainnet transaction signing is disabled.",
+            "Astatine is a non-custodial CPU/GPU miner. CPU is the default backend. GPU candidates are checked again by the canonical CPU WorkHasher before entering the bounded proof pipeline. Testnet transaction authorizations count their maximum possible INJ exposure cumulatively for the session; RPC receipts never refund signing authority. Permissionless finalization can spend gas for empty windows or windows won by another miner. Automatic AST reward forwarding is disabled because the selected RPC can fabricate reward evidence; verify rewards independently and transfer manually. --compute-only never signs or submits transactions. Mainnet transaction signing is disabled.",
         )
         .subcommand_required(true)
         .arg_required_else_help(true)
@@ -177,6 +186,12 @@ fn command() -> ClapCommand {
                         .long("confirmation-blocks")
                         .value_name("N")
                         .value_parser(clap::value_parser!(u8).range(1..=12)),
+                )
+                .arg(
+                    Arg::new("rpc")
+                        .long("rpc")
+                        .value_name("URL")
+                        .help("Use and save a custom RPC for the selected network"),
                 ),
         )
         .subcommand(
@@ -194,8 +209,14 @@ fn command() -> ClapCommand {
                     Arg::new("compute-only")
                         .long("compute-only")
                         .action(clap::ArgAction::SetTrue)
-                        .conflicts_with("send-rewards-to")
                         .help("Hash verified work locally without signing or sending transactions"),
+                )
+                .arg(
+                    Arg::new("new-session")
+                        .long("new-session")
+                        .action(clap::ArgAction::SetTrue)
+                        .conflicts_with("compute-only")
+                        .help("Explicitly authorize a separate spending session after prior spending"),
                 )
                 .arg(
                     Arg::new("threads")
@@ -218,7 +239,38 @@ fn command() -> ClapCommand {
                         .long("send-rewards-to")
                         .value_name("ADDRESS")
                         .value_parser(parse_reward_destination)
-                        .help("Forward verified AST rewards earned by this invocation to an EVM address"),
+                        .help("Disabled in Testnet.13: RPC reward evidence cannot authorize AST transfers"),
+                ),
+        )
+        .subcommand(
+            ClapCommand::new("get")
+                .about("Read local configuration")
+                .subcommand_required(true)
+                .subcommand(
+                    ClapCommand::new("rpc")
+                        .about("Show the active RPC and bundled fallback without connecting")
+                        .arg(
+                            Arg::new("network")
+                                .long("network")
+                                .value_name("NETWORK")
+                                .value_parser(["testnet", "mainnet"]),
+                        ),
+                ),
+        )
+        .subcommand(
+            ClapCommand::new("set")
+                .about("Update local configuration")
+                .subcommand_required(true)
+                .subcommand(
+                    ClapCommand::new("rpc")
+                        .about("Set a trusted RPC, or restore the bundled default")
+                        .arg(Arg::new("url").value_name("URL").num_args(0..=1))
+                        .arg(
+                            Arg::new("network")
+                                .long("network")
+                                .value_name("NETWORK")
+                                .value_parser(["testnet", "mainnet"]),
+                        ),
                 ),
         )
         .subcommand(wallet_command())
@@ -294,7 +346,7 @@ fn command() -> ClapCommand {
                 ),
         )
         .subcommand(ClapCommand::new("status").about("Show local miner status"))
-        .subcommand(ClapCommand::new("rewards").about("Show the verified AST token balance"))
+        .subcommand(ClapCommand::new("rewards").about("Show the selected RPC's AST token balance"))
         .subcommand(
             ClapCommand::new("update")
                 .about("Check for and install an authenticated release update")
@@ -367,6 +419,7 @@ fn parse_matches(matches: &ArgMatches) -> Command {
             minimum_reserve_inj: args.get_one::<String>("minimum-reserve-inj").cloned(),
             spending_limit_inj: args.get_one::<String>("spending-limit-inj").cloned(),
             transaction_confirmations: args.get_one::<u8>("confirmation-blocks").copied(),
+            rpc: args.get_one::<String>("rpc").cloned(),
         }),
         Some(("mine", args)) => Command::Mine(MineArgs {
             device: args
@@ -380,6 +433,7 @@ fn parse_matches(matches: &ArgMatches) -> Command {
                 .map(|nodes| nodes.copied().collect())
                 .unwrap_or_default(),
             send_rewards_to: args.get_one::<Address>("send-rewards-to").copied(),
+            new_session: args.get_flag("new-session"),
         }),
         Some(("wallet", args)) => match args.subcommand() {
             Some(("create", _)) => Command::Wallet(WalletCommand::Create),
@@ -407,6 +461,19 @@ fn parse_matches(matches: &ArgMatches) -> Command {
                 Command::NetworkUse(network)
             }
             _ => unreachable!("network requires a known subcommand"),
+        },
+        Some(("get", args)) => match args.subcommand() {
+            Some(("rpc", args)) => Command::GetRpc {
+                network: parse_network_option(args),
+            },
+            _ => unreachable!("get requires a known subcommand"),
+        },
+        Some(("set", args)) => match args.subcommand() {
+            Some(("rpc", args)) => Command::SetRpc {
+                network: parse_network_option(args),
+                endpoint: args.get_one::<String>("url").cloned(),
+            },
+            _ => unreachable!("set requires a known subcommand"),
         },
         Some(("nodes", _)) => Command::Nodes,
         Some(("status", _)) => Command::Status,
@@ -440,11 +507,20 @@ fn parse_matches(matches: &ArgMatches) -> Command {
     }
 }
 
+fn parse_network_option(args: &ArgMatches) -> Option<Network> {
+    args.get_one::<String>("network")
+        .map(|value| match value.as_str() {
+            "testnet" => Network::Testnet,
+            "mainnet" => Network::Mainnet,
+            _ => unreachable!("network parser restricts the accepted values"),
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        BenchmarkArgs, Command, DeviceChoice, ImportArgs, Network, NonZeroUsize, WalletCommand,
-        try_parse_from,
+        BenchmarkArgs, Command, DeviceChoice, ImportArgs, InitArgs, Network, NonZeroUsize,
+        WalletCommand, try_parse_from,
     };
     use alloy_primitives::Address;
     use std::path::PathBuf;
@@ -470,6 +546,7 @@ mod tests {
         assert_eq!(args.threads.map(|threads| threads.get()), Some(4));
         assert_eq!(args.nodes, [1, 3, 5]);
         assert_eq!(args.send_rewards_to, None);
+        assert!(!args.new_session);
     }
 
     #[test]
@@ -481,6 +558,7 @@ mod tests {
         assert!(!args.compute_only);
         assert_eq!(args.device, DeviceChoice::Cpu);
         assert_eq!(args.send_rewards_to, None);
+        assert!(!args.new_session);
     }
 
     #[test]
@@ -634,7 +712,8 @@ mod tests {
                 "--send-rewards-to",
                 checksummed
             ])
-            .is_err()
+            .is_ok(),
+            "the mining runtime rejects the deprecated option with the RPC-trust explanation"
         );
     }
 
@@ -653,6 +732,7 @@ mod tests {
             panic!("expected init subcommand");
         };
         assert_eq!(args.transaction_confirmations, Some(4));
+        assert_eq!(args.rpc, None);
         assert!(try_parse_from(["astatine", "init", "--confirmation-blocks", "0"]).is_err());
         assert!(try_parse_from(["astatine", "init", "--confirmation-blocks", "13"]).is_err());
     }
@@ -690,5 +770,73 @@ mod tests {
             check.command,
             Command::Update(super::UpdateArgs { check_only: true })
         );
+    }
+
+    #[test]
+    fn parses_rpc_management_and_explicit_new_session_commands() {
+        assert_eq!(
+            try_parse_from(["astatine", "get", "rpc"]).unwrap().command,
+            Command::GetRpc { network: None }
+        );
+        assert_eq!(
+            try_parse_from(["astatine", "get", "rpc", "--network", "testnet"])
+                .unwrap()
+                .command,
+            Command::GetRpc {
+                network: Some(Network::Testnet)
+            }
+        );
+        assert_eq!(
+            try_parse_from([
+                "astatine",
+                "set",
+                "rpc",
+                "https://rpc.example.org/evm",
+                "--network",
+                "mainnet",
+            ])
+            .unwrap()
+            .command,
+            Command::SetRpc {
+                network: Some(Network::Mainnet),
+                endpoint: Some("https://rpc.example.org/evm".to_owned()),
+            }
+        );
+        assert_eq!(
+            try_parse_from(["astatine", "set", "rpc", "default"])
+                .unwrap()
+                .command,
+            Command::SetRpc {
+                network: None,
+                endpoint: Some("default".to_owned()),
+            }
+        );
+        assert_eq!(
+            try_parse_from(["astatine", "set", "rpc"]).unwrap().command,
+            Command::SetRpc {
+                network: None,
+                endpoint: None,
+            }
+        );
+        assert_eq!(
+            try_parse_from(["astatine", "init", "--rpc", "https://rpc.example.org"])
+                .unwrap()
+                .command,
+            Command::Init(InitArgs {
+                network: None,
+                threads: None,
+                minimum_reserve_inj: None,
+                spending_limit_inj: None,
+                transaction_confirmations: None,
+                rpc: Some("https://rpc.example.org".to_owned()),
+            })
+        );
+
+        let new_session = try_parse_from(["astatine", "mine", "--new-session"]).unwrap();
+        let Command::Mine(args) = new_session.command else {
+            panic!("expected mine subcommand");
+        };
+        assert!(args.new_session);
+        assert!(try_parse_from(["astatine", "mine", "--new-session", "--compute-only"]).is_err());
     }
 }

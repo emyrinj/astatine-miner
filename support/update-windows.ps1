@@ -1,23 +1,103 @@
 param(
-    [Parameter(Mandatory = $true)][int]$ParentPid,
-    [Parameter(Mandatory = $true)][string]$PlanPath
+    [switch]$CompareVersions,
+    [string]$CurrentVersion,
+    [string]$CandidateVersion,
+    [switch]$VerifyVersionOutput,
+    [string]$ExpectedVersion,
+    [string]$VersionOutputJson,
+    [int]$ParentPid,
+    [string]$PlanPath
 )
 
 $ErrorActionPreference = 'Stop'
-$Plan = Get-Content -LiteralPath $PlanPath -Raw | ConvertFrom-Json
 $Applied = New-Object System.Collections.ArrayList
 $LockStream = $null
 $LockAcquired = $false
 $Committed = $false
 
-function Get-TestnetVersion([string]$Text) {
-    $Match = [regex]::Match($Text, 'astatine\s+(\d+)\.(\d+)\.(\d+)-testnet\.(\d+)')
-    if (-not $Match.Success) { return $null }
+function ConvertTo-AstatineVersion([string]$Text) {
+    $Match = [regex]::Match(
+        $Text,
+        '^(?:astatine\s+)?(?<Major>0|[1-9][0-9]*)\.(?<Minor>0|[1-9][0-9]*)\.(?<Patch>0|[1-9][0-9]*)(?:-testnet\.(?<Sequence>0|[1-9][0-9]*))?$'
+    )
+    if (-not $Match.Success) { throw "Unsupported Astatine version format: $Text" }
+    $Values = @(
+        [System.UInt64]::Parse($Match.Groups['Major'].Value, [System.Globalization.CultureInfo]::InvariantCulture),
+        [System.UInt64]::Parse($Match.Groups['Minor'].Value, [System.Globalization.CultureInfo]::InvariantCulture),
+        [System.UInt64]::Parse($Match.Groups['Patch'].Value, [System.Globalization.CultureInfo]::InvariantCulture)
+    )
+    if ($Values | Where-Object { $_ -gt 2147483647 }) { throw "Astatine version component exceeds the supported SemVer range: $Text" }
+    $IsPrerelease = $Match.Groups['Sequence'].Success
+    $Sequence = [UInt64]0
+    if ($IsPrerelease) {
+        $Sequence = [System.UInt64]::Parse($Match.Groups['Sequence'].Value, [System.Globalization.CultureInfo]::InvariantCulture)
+        if ($Sequence -gt 2147483647) { throw "Astatine prerelease identifier exceeds the supported SemVer range: $Text" }
+    }
     return [pscustomobject]@{
-        Core = [Version]::Parse("$($Match.Groups[1].Value).$($Match.Groups[2].Value).$($Match.Groups[3].Value)")
-        Sequence = [UInt64]::Parse($Match.Groups[4].Value)
+        Major = $Values[0]
+        Minor = $Values[1]
+        Patch = $Values[2]
+        IsPrerelease = $IsPrerelease
+        Sequence = $Sequence
     }
 }
+
+function Compare-AstatineVersions([string]$Current, [string]$Candidate) {
+    $CurrentParsed = ConvertTo-AstatineVersion $Current
+    $CandidateParsed = ConvertTo-AstatineVersion $Candidate
+    foreach ($Field in @('Major', 'Minor', 'Patch')) {
+        if ($CurrentParsed.$Field -lt $CandidateParsed.$Field) { return -1 }
+        if ($CurrentParsed.$Field -gt $CandidateParsed.$Field) { return 1 }
+    }
+    if ($CurrentParsed.IsPrerelease -ne $CandidateParsed.IsPrerelease) {
+        if ($CurrentParsed.IsPrerelease) { return -1 }
+        return 1
+    }
+    if ($CurrentParsed.IsPrerelease) {
+        if ($CurrentParsed.Sequence -lt $CandidateParsed.Sequence) { return -1 }
+        if ($CurrentParsed.Sequence -gt $CandidateParsed.Sequence) { return 1 }
+    }
+    return 0
+}
+
+function Assert-AstatineVersionOutput([string[]]$Output, [string]$Expected) {
+    if ($null -eq $Output -or $Output.Count -ne 1) {
+        throw 'Executable --version output must contain exactly one line'
+    }
+    $null = ConvertTo-AstatineVersion $Expected
+    if ($Output[0] -cne "astatine $Expected") {
+        throw 'Executable --version output does not exactly match the expected version'
+    }
+}
+
+if ($CompareVersions) {
+    try {
+        if (-not $CurrentVersion -or -not $CandidateVersion) { throw 'Both current and candidate versions are required' }
+        Write-Output (Compare-AstatineVersions $CurrentVersion $CandidateVersion)
+        exit 0
+    } catch {
+        [Console]::Error.WriteLine($_.Exception.Message)
+        exit 2
+    }
+}
+
+if ($VerifyVersionOutput) {
+    try {
+        if (-not $ExpectedVersion) { throw 'ExpectedVersion is required' }
+        $OutputLines = @(ConvertFrom-Json -InputObject $VersionOutputJson)
+        Assert-AstatineVersionOutput $OutputLines $ExpectedVersion
+        Write-Output '0'
+        exit 0
+    } catch {
+        [Console]::Error.WriteLine($_.Exception.Message)
+        exit 2
+    }
+}
+
+if ($ParentPid -le 0 -or [string]::IsNullOrWhiteSpace($PlanPath)) {
+    throw 'ParentPid and PlanPath are required outside version-comparison mode.'
+}
+$Plan = Get-Content -LiteralPath $PlanPath -Raw | ConvertFrom-Json
 
 try {
     while (Get-Process -Id $ParentPid -ErrorAction SilentlyContinue) {
@@ -28,14 +108,12 @@ try {
     $LockAcquired = $true
 
     $CurrentOutput = & $Plan.executable --version 2>&1
-    if ($LASTEXITCODE -eq 0) {
-        $Current = Get-TestnetVersion ($CurrentOutput -join "`n")
-        $Candidate = Get-TestnetVersion $Plan.expected_version
-        if ($null -ne $Current -and $null -ne $Candidate -and $Current.Core -eq $Candidate.Core -and $Current.Sequence -gt $Candidate.Sequence) {
-            "Skipped stale Astatine update $($Plan.expected_version); $($CurrentOutput -join "`n") is newer." | Set-Content -LiteralPath $Plan.log -Encoding UTF8
-            $Committed = $true
-            return
-        }
+    if ($LASTEXITCODE -ne 0) { throw 'Refusing to update an executable whose installed version could not be read.' }
+    $VersionOrder = Compare-AstatineVersions ($CurrentOutput -join "`n") $Plan.expected_version
+    if ($VersionOrder -gt 0) {
+        "Skipped stale Astatine update $($Plan.expected_version); $($CurrentOutput -join "`n") is newer." | Set-Content -LiteralPath $Plan.log -Encoding UTF8
+        $Committed = $true
+        return
     }
 
     foreach ($File in $Plan.files) {
@@ -47,9 +125,10 @@ try {
     }
 
     $VersionOutput = & $Plan.executable --version 2>&1
-    if ($LASTEXITCODE -ne 0 -or (($VersionOutput -join "`n") -notmatch [regex]::Escape($Plan.expected_version))) {
+    if ($LASTEXITCODE -ne 0) {
         throw 'The installed executable failed its version smoke test.'
     }
+    Assert-AstatineVersionOutput $VersionOutput $Plan.expected_version
 
     $Committed = $true
     foreach ($File in $Plan.files) {
